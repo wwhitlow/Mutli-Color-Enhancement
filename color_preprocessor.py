@@ -21,7 +21,11 @@ import sys
 import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 
-import numpy as np
+try:
+    import cupy as xp          # NVIDIA GPU
+except ImportError:
+    import numpy as xp
+#import numpy as np
 from PIL import Image, ImageTk
 from pathlib import Path
 
@@ -45,22 +49,22 @@ def text_color_for_bg(r: int, g: int, b: int) -> str:
     return "black" if luminance > 128 else "white"
 
 
-def rgb_to_lab(arr: np.ndarray) -> np.ndarray:
+def rgb_to_lab(arr: xp.ndarray) -> xp.ndarray:
     """
     Convert an (N, 3) float32/uint8 RGB array (values 0-255) to CIE L*a*b*.
     Uses the D65 illuminant.  Pure NumPy — no extra dependencies.
     """
-    rgb = arr.astype(np.float64) / 255.0
+    rgb = arr.astype(xp.float64) / 255.0
 
     # sRGB gamma expansion → linear light
-    linear = np.where(
+    linear = xp.where(
         rgb > 0.04045,
         ((rgb + 0.055) / 1.055) ** 2.4,
         rgb / 12.92,
     )
 
     # Linear RGB → XYZ  (IEC 61966-2-1, D65)
-    M = np.array(
+    M = xp.array(
         [
             [0.4124564, 0.3575761, 0.1804375],
             [0.2126729, 0.7151522, 0.0721750],
@@ -70,22 +74,22 @@ def rgb_to_lab(arr: np.ndarray) -> np.ndarray:
     xyz = linear @ M.T  # (N, 3)
 
     # XYZ → L*a*b*
-    ref = np.array([0.95047, 1.00000, 1.08883])  # D65 white point
+    ref = xp.array([0.95047, 1.00000, 1.08883])  # D65 white point
     xyz_n = xyz / ref
 
     eps, kap = 0.008856, 903.3
-    f = np.where(xyz_n > eps, np.cbrt(xyz_n), (kap * xyz_n + 16.0) / 116.0)
+    f = xp.where(xyz_n > eps, xp.cbrt(xyz_n), (kap * xyz_n + 16.0) / 116.0)
 
     L = 116.0 * f[:, 1] - 16.0
     a = 500.0 * (f[:, 0] - f[:, 1])
     b = 200.0 * (f[:, 1] - f[:, 2])
 
-    return np.stack([L, a, b], axis=1).astype(np.float32)
+    return xp.stack([L, a, b], axis=1).astype(xp.float32)
 
 
 # Approximate maximum distances in each color space (used to scale tolerance)
-_MAX_RGB_DIST = float(np.sqrt(3 * 255**2))   # ≈ 441.7
-_MAX_LAB_DIST = float(np.sqrt(100**2 + 255**2 + 255**2))  # ≈ 383 (generous)
+_MAX_RGB_DIST = float(xp.sqrt(3 * 255**2))   # ≈ 441.7
+_MAX_LAB_DIST = float(xp.sqrt(100**2 + 255**2 + 255**2))  # ≈ 383 (generous)
 
 
 def kmeans_colors(image: Image.Image, k: int, max_iter: int = 25) -> list:
@@ -94,33 +98,33 @@ def kmeans_colors(image: Image.Image, k: int, max_iter: int = 25) -> list:
     Operates on a random subsample of ≤ 10 000 pixels for speed.
     Returns a list of k (r, g, b) tuples sorted by cluster size (largest first).
     """
-    arr = np.array(image.convert("RGB"), dtype=np.float32)
+    arr = xp.array(image.convert("RGB"), dtype=xp.float32)
     pixels = arr.reshape(-1, 3)
 
     # Subsample
     if len(pixels) > 10_000:
-        rng = np.random.default_rng(42)
+        rng = xp.random.default_rng(42)
         idx = rng.choice(len(pixels), 10_000, replace=False)
         pixels = pixels[idx]
 
     # K-means++ initialisation
-    rng = np.random.default_rng(0)
+    rng = xp.random.default_rng(0)
     centroids = [pixels[rng.integers(len(pixels))]]
     for _ in range(k - 1):
-        dists = np.min(
-            np.linalg.norm(pixels[:, None] - np.array(centroids)[None], axis=2),
+        dists = xp.min(
+            xp.linalg.norm(pixels[:, None] - xp.array(centroids)[None], axis=2),
             axis=1,
         )
         probs = dists**2 / (dists**2).sum()
         centroids.append(pixels[rng.choice(len(pixels), p=probs)])
-    centroids = np.array(centroids, dtype=np.float32)  # (k, 3)
+    centroids = xp.array(centroids, dtype=xp.float32)  # (k, 3)
 
-    labels = np.zeros(len(pixels), dtype=np.int32)
+    labels = xp.zeros(len(pixels), dtype=xp.int32)
     for _ in range(max_iter):
         # Assignment step
         diff = pixels[:, None, :] - centroids[None, :, :]  # (P, k, 3)
-        new_labels = np.argmin(np.sum(diff**2, axis=2), axis=1)
-        if np.array_equal(new_labels, labels):
+        new_labels = xp.argmin(xp.sum(diff**2, axis=2), axis=1)
+        if xp.array_equal(new_labels, labels):
             break
         labels = new_labels
         # Update step
@@ -130,11 +134,11 @@ def kmeans_colors(image: Image.Image, k: int, max_iter: int = 25) -> list:
                 centroids[j] = pixels[mask].mean(axis=0)
 
     # Sort by cluster size (most dominant first)
-    counts = [(np.sum(labels == j), j) for j in range(k)]
+    counts = [(xp.sum(labels == j), j) for j in range(k)]
     counts.sort(reverse=True)
     result = []
     for _, j in counts:
-        r, g, b = centroids[j].round().astype(np.uint8)
+        r, g, b = centroids[j].round().astype(xp.uint8)
         result.append((int(r), int(g), int(b)))
     return result
 
@@ -662,12 +666,12 @@ class App:
         if not active:
             return image.copy()
 
-        arr = np.array(image, dtype=np.uint8)
+        arr = xp.array(image, dtype=xp.uint8)
         H, W = arr.shape[:2]
-        flat = arr.reshape(-1, 3).astype(np.float32)  # (P, 3)
+        flat = arr.reshape(-1, 3).astype(xp.float32)  # (P, 3)
 
-        samples = np.array([s.sample_rgb for s in active], dtype=np.float32)   # (N, 3)
-        targets = np.array([s.target_rgb for s in active], dtype=np.uint8)     # (N, 3)
+        samples = xp.array([s.sample_rgb for s in active], dtype=xp.float32)   # (N, 3)
+        targets = xp.array([s.target_rgb for s in active], dtype=xp.uint8)     # (N, 3)
 
         if self._use_lab.get():
             flat_sp    = rgb_to_lab(flat)     # (P, 3)
@@ -679,20 +683,20 @@ class App:
             max_dist   = _MAX_RGB_DIST
 
         # Scaled tolerance thresholds for each slot
-        tols = np.array(
-            [(s.tolerance / 100.0) * max_dist for s in active], dtype=np.float32
+        tols = xp.array(
+            [(s.tolerance / 100.0) * max_dist for s in active], dtype=xp.float32
         )  # (N,)
 
         # Per-pixel distance to each sample: (P, N)
         diff = flat_sp[:, None, :] - samples_sp[None, :, :]   # (P, N, 3)
-        dist = np.sqrt(np.einsum("pnc,pnc->pn", diff, diff))  # (P, N)
+        dist = xp.sqrt(xp.einsum("pnc,pnc->pn", diff, diff))  # (P, N)
 
         within    = dist <= tols[None, :]           # (P, N)  bool
-        dist_m    = np.where(within, dist, np.inf)  # (P, N)  masked
-        best      = np.argmin(dist_m, axis=1)       # (P,)
-        has_match = np.any(within, axis=1)           # (P,)
+        dist_m    = xp.where(within, dist, xp.inf)  # (P, N)  masked
+        best      = xp.argmin(dist_m, axis=1)       # (P,)
+        has_match = xp.any(within, axis=1)           # (P,)
 
-        result = flat.astype(np.uint8).copy()
+        result = flat.astype(xp.uint8).copy()
         result[has_match] = targets[best[has_match]]
 
         return Image.fromarray(result.reshape(H, W, 3))
