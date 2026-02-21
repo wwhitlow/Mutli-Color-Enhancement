@@ -18,6 +18,7 @@ Workflow:
 """
 
 import sys
+import threading
 import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 
@@ -141,6 +142,65 @@ def kmeans_colors(image: Image.Image, k: int, max_iter: int = 25) -> list:
         r, g, b = centroids[j].round().astype(xp.uint8)
         result.append((int(r), int(g), int(b)))
     return result
+
+
+# ---------------------------------------------------------------------------
+# Core processing (module-level so it can be called from background threads)
+# ---------------------------------------------------------------------------
+
+def _process_image(
+    image: Image.Image,
+    slot_params: list,   # [(sample_rgb, target_rgb, tolerance), ...]
+    use_lab: bool,
+) -> Image.Image:
+    """
+    Remap pixels in *image* according to the color slot settings.
+
+    Each active slot defines a (sample_rgb, target_rgb, tolerance) triple.
+    For every pixel, the nearest sample color within its slot's tolerance wins
+    and the pixel is replaced with that slot's target color.
+
+    Memory strategy: slots are processed one at a time, keeping peak working
+    memory at O(P×3) instead of the O(P×N×3) that a fully-vectorised
+    broadcast would require.  For a 72 MP image with N=5 slots the old
+    approach would allocate ~4.3 GB; this approach uses ~864 MB regardless
+    of the number of slots.
+    """
+    if not slot_params:
+        return image.copy()
+
+    arr = xp.array(image, dtype=xp.uint8)
+    H, W = arr.shape[:2]
+    P = H * W
+    flat = arr.reshape(P, 3).astype(xp.float32)   # (P, 3)
+
+    max_dist = _MAX_LAB_DIST if use_lab else _MAX_RGB_DIST
+
+    # Convert all pixels to the working colour space once
+    flat_sp = rgb_to_lab(flat) if use_lab else flat   # (P, 3)
+
+    targets = xp.array([p[1] for p in slot_params], dtype=xp.uint8)  # (N, 3)
+
+    best_dist = xp.full(P, xp.inf, dtype=xp.float32)
+    best_idx  = xp.full(P, -1,    dtype=xp.int32)
+
+    for i, (sample_rgb, _target_rgb, tolerance) in enumerate(slot_params):
+        sample = xp.array([sample_rgb], dtype=xp.float32)              # (1, 3)
+        sample_sp = rgb_to_lab(sample) if use_lab else sample           # (1, 3)
+        tol = (tolerance / 100.0) * max_dist
+
+        d = xp.sqrt(xp.sum((flat_sp - sample_sp) ** 2, axis=1))        # (P,)
+        better = (d <= tol) & (d < best_dist)
+        best_dist = xp.where(better, d, best_dist)
+        best_idx  = xp.where(better, i, best_idx)
+
+    has_match = best_idx >= 0
+    result = flat.astype(xp.uint8).copy()
+    result[has_match] = targets[best_idx[has_match]]
+
+    # CuPy arrays live on the GPU; PIL needs a CPU numpy array
+    cpu = result.get() if hasattr(result, "get") else result
+    return Image.fromarray(cpu.reshape(H, W, 3))
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +372,9 @@ class App:
         self._showing_proc: bool = False
         self._color_slots: list[ColorSlot] = []
         self._active_slot: ColorSlot | None = None
+        self._settings_dirty: bool = True   # True → cache is stale, must reprocess
+        self._processing: bool = False       # True → background worker is running
+        self._preview_btn: ttk.Button | None = None
 
         self._use_lab = tk.BooleanVar(value=True)
         self._live_prev = tk.BooleanVar(value=False)
@@ -332,7 +395,8 @@ class App:
 
         ttk.Button(tb, text="Open Image",   command=self._open).pack(side="left", padx=2)
         ttk.Separator(tb, orient="vertical").pack(side="left", fill="y", padx=6)
-        ttk.Button(tb, text="Preview",      command=self._do_preview).pack(side="left", padx=2)
+        self._preview_btn = ttk.Button(tb, text="Preview", command=self._do_preview)
+        self._preview_btn.pack(side="left", padx=2)
         ttk.Button(tb, text="Show Original",command=self._show_original).pack(side="left", padx=2)
         ttk.Separator(tb, orient="vertical").pack(side="left", fill="y", padx=6)
         ttk.Button(tb, text="Export…",      command=self._export).pack(side="left", padx=2)
@@ -448,6 +512,7 @@ class App:
 
         self._proc_image = None
         self._showing_proc = False
+        self._settings_dirty = True
         self._zoom_idx = self._DEFAULT_ZOOM
         self._render_canvas(self._orig_image)
         name = Path(path).name
@@ -630,6 +695,7 @@ class App:
         self._slot_changed()
 
     def _slot_changed(self) -> None:
+        self._settings_dirty = True
         if self._live_prev.get() and self._orig_image is not None:
             self._do_preview()
 
@@ -639,67 +705,72 @@ class App:
         if self._orig_image is None:
             messagebox.showwarning("No image", "Open an image first.")
             return
+        if self._processing:
+            return  # already running
+
+        # Cache hit — nothing changed since last process, just (re-)display
+        if not self._settings_dirty and self._proc_image is not None:
+            self._showing_proc = True
+            self._render_canvas(self._proc_image)
+            self._status.set("Preview (cached)  —  click 'Show Original' to compare, or Export when done.")
+            return
+
+        # Snapshot settings on the main thread before handing off to worker
+        use_lab = self._use_lab.get()
+        slot_params = [
+            (s.sample_rgb, s.target_rgb, s.tolerance)
+            for s in self._color_slots if s.is_ready()
+        ]
+        image = self._orig_image
+
+        self._set_processing(True)
         self._status.set("Processing…")
         self.root.update_idletasks()
-        self._proc_image = self._process(self._orig_image)
+
+        def _worker():
+            try:
+                result = _process_image(image, slot_params, use_lab)
+            except Exception as exc:
+                self.root.after(0, lambda: self._on_process_error(exc))
+                return
+            self.root.after(0, lambda: self._on_process_done(result))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_process_done(self, result: Image.Image) -> None:
+        self._proc_image = result
+        self._settings_dirty = False
         self._showing_proc = True
-        self._render_canvas(self._proc_image)
+        self._set_processing(False)
+        self._render_canvas(result)
         self._status.set("Preview  —  click 'Show Original' to compare, or Export when done.")
+
+    def _on_process_error(self, exc: Exception) -> None:
+        self._set_processing(False)
+        self._status.set(f"Processing failed: {exc}")
+        messagebox.showerror("Processing failed", str(exc))
+
+    def _set_processing(self, busy: bool) -> None:
+        self._processing = busy
+        if self._preview_btn:
+            self._preview_btn.config(state="disabled" if busy else "normal")
 
     def _show_original(self) -> None:
         if self._orig_image is None:
             return
+        # Do NOT clear _proc_image — keep the cache intact for the next Preview click
         self._showing_proc = False
         self._render_canvas(self._orig_image)
         self._status.set("Showing original image.")
 
     def _process(self, image: Image.Image) -> Image.Image:
-        """
-        Vectorised NumPy color-remapping pipeline.
-
-        For each pixel, compute its distance (in RGB or LAB space) to every
-        active slot's sample color.  The closest matching slot within its
-        tolerance threshold wins and the pixel is replaced with that slot's
-        target color.  Pixels that match no slot are left unchanged.
-        """
-        active = [s for s in self._color_slots if s.is_ready()]
-        if not active:
-            return image.copy()
-
-        arr = xp.array(image, dtype=xp.uint8)
-        H, W = arr.shape[:2]
-        flat = arr.reshape(-1, 3).astype(xp.float32)  # (P, 3)
-
-        samples = xp.array([s.sample_rgb for s in active], dtype=xp.float32)   # (N, 3)
-        targets = xp.array([s.target_rgb for s in active], dtype=xp.uint8)     # (N, 3)
-
-        if self._use_lab.get():
-            flat_sp    = rgb_to_lab(flat)     # (P, 3)
-            samples_sp = rgb_to_lab(samples)  # (N, 3)
-            max_dist   = _MAX_LAB_DIST
-        else:
-            flat_sp    = flat
-            samples_sp = samples
-            max_dist   = _MAX_RGB_DIST
-
-        # Scaled tolerance thresholds for each slot
-        tols = xp.array(
-            [(s.tolerance / 100.0) * max_dist for s in active], dtype=xp.float32
-        )  # (N,)
-
-        # Per-pixel distance to each sample: (P, N)
-        diff = flat_sp[:, None, :] - samples_sp[None, :, :]   # (P, N, 3)
-        dist = xp.sqrt(xp.einsum("pnc,pnc->pn", diff, diff))  # (P, N)
-
-        within    = dist <= tols[None, :]           # (P, N)  bool
-        dist_m    = xp.where(within, dist, xp.inf)  # (P, N)  masked
-        best      = xp.argmin(dist_m, axis=1)       # (P,)
-        has_match = xp.any(within, axis=1)           # (P,)
-
-        result = flat.astype(xp.uint8).copy()
-        result[has_match] = targets[best[has_match]]
-
-        return Image.fromarray(result.reshape(H, W, 3))
+        """Full-resolution process used by Export."""
+        use_lab = self._use_lab.get()
+        slot_params = [
+            (s.sample_rgb, s.target_rgb, s.tolerance)
+            for s in self._color_slots if s.is_ready()
+        ]
+        return _process_image(image, slot_params, use_lab)
 
     # ================================================================ export
 
@@ -707,13 +778,19 @@ class App:
         if self._orig_image is None:
             messagebox.showwarning("No image", "Open an image first.")
             return
-        if self._proc_image is None:
+
+        # Use the cached full-res result if settings haven't changed since last Preview
+        if self._settings_dirty or self._proc_image is None:
             if not messagebox.askyesno(
-                "No preview",
-                "No preview has been generated yet.\nProcess and export now?",
+                "No current preview",
+                "Settings have changed since the last preview (or no preview exists).\n"
+                "Process and export the full-resolution image now?",
             ):
                 return
+            self._status.set("Exporting (processing full resolution)…")
+            self.root.update_idletasks()
             self._proc_image = self._process(self._orig_image)
+            self._settings_dirty = False
 
         path = filedialog.asksaveasfilename(
             title="Export processed image",
