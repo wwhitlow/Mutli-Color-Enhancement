@@ -22,11 +22,12 @@ import threading
 import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 
+import numpy as np              # always CPU numpy — needed for PIL-based deskew
+
 try:
     import cupy as xp          # NVIDIA GPU
 except ImportError:
     import numpy as xp
-#import numpy as np
 from PIL import Image, ImageTk
 from pathlib import Path
 
@@ -204,6 +205,64 @@ def _process_image(
 
 
 # ---------------------------------------------------------------------------
+# Deskew utilities (always CPU — operates on PIL images, not GPU arrays)
+# ---------------------------------------------------------------------------
+
+def _find_skew_angle(image: Image.Image, max_angle: float = 15.0) -> float:
+    """
+    Estimate scan skew using projection profile variance maximisation.
+
+    Works on a downsampled grayscale copy (≤ 1200 px wide) for speed.
+    Searches ±max_angle degrees in 0.2° steps; the angle whose row-sum
+    projection has the highest variance is the one that best aligns the
+    dominant horizontal features (box borders, text baselines).
+
+    Best called on the colour-processed image rather than the raw scan:
+    the clean solid regions make the profile much crisper.
+
+    Returns the correction angle to pass directly to Image.rotate()
+    (PIL convention: positive = counter-clockwise).
+    """
+    MAX_SIDE = 1200
+    scale = min(1.0, MAX_SIDE / max(image.width, image.height))
+    small = image.resize(
+        (max(1, int(image.width * scale)), max(1, int(image.height * scale))),
+        Image.LANCZOS,
+    )
+    gray = np.array(small.convert("L"), dtype=np.float32)
+    thresh = gray.mean()
+    binary = Image.fromarray(((gray < thresh) * 255).astype(np.uint8))
+
+    best_angle, best_score = 0.0, -1.0
+    for angle in np.arange(-max_angle, max_angle + 0.01, 0.2):
+        rot = binary.rotate(float(angle), expand=False, fillcolor=0)
+        row_sums = np.array(rot, dtype=np.float64).sum(axis=1)
+        score = float(row_sums.var())
+        if score > best_score:
+            best_score, best_angle = score, float(angle)
+    return best_angle
+
+
+def _apply_deskew(image: Image.Image, angle: float) -> Image.Image:
+    """
+    Rotate image by angle degrees CCW (PIL convention), expanding the canvas
+    to fit the full rotated content.  Fill colour is inferred from the four
+    corner pixels of the original image.
+    """
+    if abs(angle) < 0.05:
+        return image.copy()
+    w, h = image.size
+    corners = [
+        image.getpixel((0, 0)),
+        image.getpixel((w - 1, 0)),
+        image.getpixel((0, h - 1)),
+        image.getpixel((w - 1, h - 1)),
+    ]
+    bg = tuple(int(round(float(np.median([c[i] for c in corners])))) for i in range(3))
+    return image.rotate(angle, expand=True, resample=Image.BICUBIC, fillcolor=bg)
+
+
+# ---------------------------------------------------------------------------
 # ColorSlot widget
 # ---------------------------------------------------------------------------
 
@@ -375,6 +434,7 @@ class App:
         self._settings_dirty: bool = True   # True → cache is stale, must reprocess
         self._processing: bool = False       # True → background worker is running
         self._preview_btn: ttk.Button | None = None
+        self._deskew_btn: ttk.Button | None = None
 
         self._use_lab = tk.BooleanVar(value=True)
         self._live_prev = tk.BooleanVar(value=False)
@@ -398,6 +458,9 @@ class App:
         self._preview_btn = ttk.Button(tb, text="Preview", command=self._do_preview)
         self._preview_btn.pack(side="left", padx=2)
         ttk.Button(tb, text="Show Original",command=self._show_original).pack(side="left", padx=2)
+        ttk.Separator(tb, orient="vertical").pack(side="left", fill="y", padx=6)
+        self._deskew_btn = ttk.Button(tb, text="Auto-Deskew", command=self._do_deskew)
+        self._deskew_btn.pack(side="left", padx=2)
         ttk.Separator(tb, orient="vertical").pack(side="left", fill="y", padx=6)
         ttk.Button(tb, text="Export…",      command=self._export).pack(side="left", padx=2)
         ttk.Separator(tb, orient="vertical").pack(side="left", fill="y", padx=6)
@@ -750,10 +813,64 @@ class App:
         self._status.set(f"Processing failed: {exc}")
         messagebox.showerror("Processing failed", str(exc))
 
+    # ================================================================ deskew
+
+    def _do_deskew(self) -> None:
+        if self._proc_image is None:
+            messagebox.showwarning(
+                "No preview",
+                "Run Preview first to apply colour mapping, then use Auto-Deskew.\n\n"
+                "The cleaner post-colour image gives much more accurate angle detection.",
+            )
+            return
+        if self._processing:
+            return
+
+        image = self._proc_image   # deskew the colour-processed result
+        self._set_processing(True)
+        self._status.set("Detecting skew angle on processed image…")
+        self.root.update_idletasks()
+
+        def _worker():
+            try:
+                angle  = _find_skew_angle(image)
+                result = _apply_deskew(image, angle)
+            except Exception as exc:
+                self.root.after(0, lambda: self._on_deskew_error(exc))
+                return
+            self.root.after(0, lambda: self._on_deskew_done(result, angle))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_deskew_done(self, result: Image.Image, angle: float) -> None:
+        if abs(angle) < 0.05:
+            self._set_processing(False)
+            self._status.set("No significant skew detected (< 0.05°).  Image unchanged.")
+            return
+        # Replace proc_image with deskewed version.
+        # _orig_image and _settings_dirty are intentionally left untouched:
+        # the cache now reflects the full pipeline (colour + deskew).
+        self._proc_image = result
+        self._showing_proc = True
+        self._set_processing(False)
+        self._render_canvas(result)
+        self._status.set(
+            f"Deskewed by {angle:+.1f}°  —  Export when done, "
+            "or adjust colours → Preview → Auto-Deskew again."
+        )
+
+    def _on_deskew_error(self, exc: Exception) -> None:
+        self._set_processing(False)
+        self._status.set(f"Deskew failed: {exc}")
+        messagebox.showerror("Deskew failed", str(exc))
+
     def _set_processing(self, busy: bool) -> None:
         self._processing = busy
+        state = "disabled" if busy else "normal"
         if self._preview_btn:
-            self._preview_btn.config(state="disabled" if busy else "normal")
+            self._preview_btn.config(state=state)
+        if self._deskew_btn:
+            self._deskew_btn.config(state=state)
 
     def _show_original(self) -> None:
         if self._orig_image is None:
