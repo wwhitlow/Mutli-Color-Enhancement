@@ -151,8 +151,10 @@ def kmeans_colors(image: Image.Image, k: int, max_iter: int = 25) -> list:
 
 def _process_image(
     image: Image.Image,
-    slot_params: list,   # [(sample_rgb, target_rgb, tolerance), ...]
+    slot_params: list,       # [(sample_rgb, target_rgb, tolerance), ...]
     use_lab: bool,
+    edge_protect: float = 0.0,   # 0.0–1.0; reduces tolerance near edges
+    smooth_mask: bool = True,    # morphological closing to fill patch holes
 ) -> Image.Image:
     """
     Remap pixels in *image* according to the color slot settings.
@@ -180,18 +182,44 @@ def _process_image(
     # Convert all pixels to the working colour space once
     flat_sp = rgb_to_lab(flat) if use_lab else flat   # (P, 3)
 
+    # Pre-compute per-pixel edge strength [0, 1] when edge_protect > 0
+    if edge_protect > 0.0:
+        lum_np = np.array(image.convert("L"), dtype=np.float32)
+        gx_np = np.zeros_like(lum_np)
+        gy_np = np.zeros_like(lum_np)
+        gx_np[:, 1:-1] = lum_np[:, 2:] - lum_np[:, :-2]
+        gy_np[1:-1, :] = lum_np[2:, :] - lum_np[:-2, :]
+        mag_np = np.hypot(gx_np, gy_np)
+        peak = float(mag_np.max()) or 1.0
+        edge_str = xp.array(mag_np / peak, dtype=xp.float32).reshape(P)
+    else:
+        edge_str = None
+
     targets = xp.array([p[1] for p in slot_params], dtype=xp.uint8)  # (N, 3)
 
     best_dist = xp.full(P, xp.inf, dtype=xp.float32)
     best_idx  = xp.full(P, -1,    dtype=xp.int32)
 
     for i, (sample_rgb, _target_rgb, tolerance) in enumerate(slot_params):
-        sample = xp.array([sample_rgb], dtype=xp.float32)              # (1, 3)
-        sample_sp = rgb_to_lab(sample) if use_lab else sample           # (1, 3)
-        tol = (tolerance / 100.0) * max_dist
+        sample    = xp.array([sample_rgb], dtype=xp.float32)
+        sample_sp = rgb_to_lab(sample) if use_lab else sample
+        tol_base  = (tolerance / 100.0) * max_dist
 
         d = xp.sqrt(xp.sum((flat_sp - sample_sp) ** 2, axis=1))        # (P,)
-        better = (d <= tol) & (d < best_dist)
+
+        if edge_str is not None:
+            eff_tol = tol_base * (1.0 - edge_protect * edge_str)        # (P,)
+            raw_match = d <= eff_tol
+        else:
+            raw_match = d <= tol_base
+
+        if smooth_mask:
+            # Morphological closing: dilate then erode fills interior holes
+            closed = _morph_erode1(_morph_dilate1(raw_match.reshape(H, W))).reshape(P)
+            better = closed & (d < best_dist)
+        else:
+            better = raw_match & (d < best_dist)
+
         best_dist = xp.where(better, d, best_dist)
         best_idx  = xp.where(better, i, best_idx)
 
@@ -208,20 +236,69 @@ def _process_image(
 # Deskew utilities (always CPU — operates on PIL images, not GPU arrays)
 # ---------------------------------------------------------------------------
 
+def _hv_edge_image(gray: np.ndarray) -> np.ndarray:
+    """
+    Return a binary edge map that keeps only near-horizontal and near-vertical
+    edges, suppressing diagonals and curves.
+
+    Strategy: compute central-difference gradient (gx, gy).  An edge is
+    "near-H/V" when the smaller gradient component is less than 40 % of the
+    larger — i.e. the gradient direction is within ~22° of horizontal or
+    vertical.  Box borders satisfy this perfectly.  Diagonal glyph strokes
+    (the slanted arms of Z, N, W, swashes, etc.) are suppressed.
+
+    Magnitude threshold: keep any edge whose strength is ≥ 10 % of the
+    maximum gradient in the image.  This removes near-zero noise without
+    risk of the percentile-vs-equal-magnitude edge case that occurs when all
+    detected edges share the same magnitude (as happens in clean solid-colour
+    images after colour processing).
+    """
+    gx = np.zeros_like(gray)
+    gy = np.zeros_like(gray)
+    gx[:, 1:-1] = gray[:, 2:] - gray[:, :-2]   # central difference, X
+    gy[1:-1, :] = gray[2:, :] - gray[:-2, :]   # central difference, Y
+
+    magnitude = np.hypot(gx, gy)
+    max_mag = float(magnitude.max())
+    if max_mag < 1.0:
+        return ((gray < gray.mean()) * 255).astype(np.uint8)   # blank fallback
+
+    abs_gx, abs_gy = np.abs(gx), np.abs(gy)
+    max_g = np.maximum(abs_gx, abs_gy)
+    min_g = np.minimum(abs_gx, abs_gy)
+
+    # Passes edges whose gradient is within ~22° of H or V
+    hv_mask = min_g < 0.4 * np.maximum(max_g, 1e-6)
+
+    # Keep edges with meaningful strength (≥ 10 % of the image's peak gradient)
+    strong = magnitude >= max_mag * 0.10
+
+    result = (strong & hv_mask).astype(np.uint8) * 255
+    if not result.any():
+        return ((gray < gray.mean()) * 255).astype(np.uint8)   # plain fallback
+    return result
+
+
 def _find_skew_angle(image: Image.Image, max_angle: float = 15.0) -> float:
     """
-    Estimate scan skew using projection profile variance maximisation.
+    Estimate scan skew using a gradient-filtered projection profile.
 
-    Works on a downsampled grayscale copy (≤ 1200 px wide) for speed.
-    Searches ±max_angle degrees in 0.2° steps; the angle whose row-sum
-    projection has the highest variance is the one that best aligns the
-    dominant horizontal features (box borders, text baselines).
+    Two-stage approach that is robust to intricate internal glyph content:
 
-    Best called on the colour-processed image rather than the raw scan:
-    the clean solid regions make the profile much crisper.
+    1. Gradient + orientation filter — compute per-pixel gradient and keep
+       only near-horizontal and near-vertical edges (see _hv_edge_image).
+       Box borders score well because they are long, straight, axis-aligned
+       lines.  Diagonal strokes, serifs, curves, and swashes score near zero
+       and are suppressed before any angle search begins.
 
-    Returns the correction angle to pass directly to Image.rotate()
-    (PIL convention: positive = counter-clockwise).
+    2. Projection-profile variance search — for each candidate angle the
+       filtered edge image is rotated and the variance of row-pixel sums is
+       measured.  When horizontal box borders are perfectly level they
+       concentrate into thin, dense rows → high variance.  The winning angle
+       is the one that produces the sharpest row structure.
+
+    Works on a downsampled copy (≤ 1200 px wide); searches ±max_angle in
+    0.2° steps.  Returns the correction angle for Image.rotate() (CCW +).
     """
     MAX_SIDE = 1200
     scale = min(1.0, MAX_SIDE / max(image.width, image.height))
@@ -230,12 +307,12 @@ def _find_skew_angle(image: Image.Image, max_angle: float = 15.0) -> float:
         Image.LANCZOS,
     )
     gray = np.array(small.convert("L"), dtype=np.float32)
-    thresh = gray.mean()
-    binary = Image.fromarray(((gray < thresh) * 255).astype(np.uint8))
+    edge_arr = _hv_edge_image(gray)
+    edge_img = Image.fromarray(edge_arr)
 
     best_angle, best_score = 0.0, -1.0
     for angle in np.arange(-max_angle, max_angle + 0.01, 0.2):
-        rot = binary.rotate(float(angle), expand=False, fillcolor=0)
+        rot = edge_img.rotate(float(angle), expand=False, fillcolor=0)
         row_sums = np.array(rot, dtype=np.float64).sum(axis=1)
         score = float(row_sums.var())
         if score > best_score:
@@ -260,6 +337,30 @@ def _apply_deskew(image: Image.Image, angle: float) -> Image.Image:
     ]
     bg = tuple(int(round(float(np.median([c[i] for c in corners])))) for i in range(3))
     return image.rotate(angle, expand=True, resample=Image.BICUBIC, fillcolor=bg)
+
+
+# ---------------------------------------------------------------------------
+# Morphological helpers (used by _process_image; work with numpy or CuPy)
+# ---------------------------------------------------------------------------
+
+def _morph_dilate1(mask: xp.ndarray) -> xp.ndarray:
+    """4-connected binary dilation by 1 px."""
+    out = mask.copy()
+    out[1:,  :] |= mask[:-1, :]
+    out[:-1, :] |= mask[1:,  :]
+    out[:,  1:] |= mask[:, :-1]
+    out[:, :-1] |= mask[:, 1: ]
+    return out
+
+
+def _morph_erode1(mask: xp.ndarray) -> xp.ndarray:
+    """4-connected binary erosion by 1 px."""
+    out = mask.copy()
+    out[1:,  :] &= mask[:-1, :]
+    out[:-1, :] &= mask[1:,  :]
+    out[:,  1:] &= mask[:, :-1]
+    out[:, :-1] &= mask[:, 1: ]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +539,9 @@ class App:
 
         self._use_lab = tk.BooleanVar(value=True)
         self._live_prev = tk.BooleanVar(value=False)
+        self._edge_protect_var: tk.IntVar | None = None
+        self._smooth_var: tk.BooleanVar | None = None
+        self._ep_label: ttk.Label | None = None
 
         self._build_ui()
         self._bind_keys()
@@ -466,6 +570,23 @@ class App:
         ttk.Separator(tb, orient="vertical").pack(side="left", fill="y", padx=6)
         ttk.Checkbutton(tb, text="LAB color space", variable=self._use_lab).pack(side="left", padx=2)
         ttk.Checkbutton(tb, text="Live preview",    variable=self._live_prev).pack(side="left", padx=2)
+        ttk.Separator(tb, orient="vertical").pack(side="left", fill="y", padx=6)
+        ttk.Label(tb, text="Edge protect:").pack(side="left", padx=(0, 2))
+        self._edge_protect_var = tk.IntVar(value=0)
+        self._ep_label = ttk.Label(tb, text=" 0%", width=4)
+        ttk.Scale(
+            tb, from_=0, to=100, orient="horizontal", length=80,
+            variable=self._edge_protect_var,
+            command=lambda _: (
+                self._ep_label.config(text=f"{self._edge_protect_var.get():2d}%"),
+                self._slot_changed(),
+            ),
+        ).pack(side="left")
+        self._ep_label.pack(side="left", padx=(0, 4))
+        self._smooth_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            tb, text="Smooth", variable=self._smooth_var, command=self._slot_changed,
+        ).pack(side="left", padx=2)
         ttk.Separator(tb, orient="vertical").pack(side="left", fill="y", padx=6)
         ttk.Button(tb, text="−", width=2, command=self._zoom_out).pack(side="left")
         self._zoom_label = ttk.Label(tb, text="100%", width=5, anchor="center")
@@ -780,6 +901,8 @@ class App:
 
         # Snapshot settings on the main thread before handing off to worker
         use_lab = self._use_lab.get()
+        edge_protect = self._edge_protect_var.get() / 100.0 if self._edge_protect_var else 0.0
+        smooth_mask  = self._smooth_var.get() if self._smooth_var else True
         slot_params = [
             (s.sample_rgb, s.target_rgb, s.tolerance)
             for s in self._color_slots if s.is_ready()
@@ -792,7 +915,9 @@ class App:
 
         def _worker():
             try:
-                result = _process_image(image, slot_params, use_lab)
+                result = _process_image(image, slot_params, use_lab,
+                                        edge_protect=edge_protect,
+                                        smooth_mask=smooth_mask)
             except Exception as exc:
                 self.root.after(0, lambda: self._on_process_error(exc))
                 return
@@ -882,12 +1007,15 @@ class App:
 
     def _process(self, image: Image.Image) -> Image.Image:
         """Full-resolution process used by Export."""
-        use_lab = self._use_lab.get()
-        slot_params = [
+        use_lab      = self._use_lab.get()
+        edge_protect = self._edge_protect_var.get() / 100.0 if self._edge_protect_var else 0.0
+        smooth_mask  = self._smooth_var.get() if self._smooth_var else True
+        slot_params  = [
             (s.sample_rgb, s.target_rgb, s.tolerance)
             for s in self._color_slots if s.is_ready()
         ]
-        return _process_image(image, slot_params, use_lab)
+        return _process_image(image, slot_params, use_lab,
+                              edge_protect=edge_protect, smooth_mask=smooth_mask)
 
     # ================================================================ export
 
