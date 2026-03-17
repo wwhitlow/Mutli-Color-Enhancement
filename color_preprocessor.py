@@ -651,6 +651,7 @@ class App:
         self._paint_slot_label: ttk.Label | None = None
         self._mask_undo_stack: list = []        # list of (ys, xs, old_vals) diffs
         self._stroke_pre: "np.ndarray | None" = None   # pre-stroke copy for undo
+        self._mask_painted: bool = False        # True → painted overrides need reprocess
         self._brush_cursor_id: "int | None" = None     # canvas item id for circle cursor
         self._last_cursor_canvasxy: "tuple | None" = None
         self._edge_protect_var: tk.IntVar | None = None
@@ -1044,6 +1045,7 @@ class App:
     def _slot_changed(self) -> None:
         self._settings_dirty = True
         self._slot_assignment = None          # invalidate mask cache
+        self._mask_painted = False
         self._mask_undo_stack.clear()         # painted edits are now meaningless
         if self._live_prev.get() and self._orig_image is not None:
             if self._mask_mode.get():
@@ -1061,7 +1063,7 @@ class App:
             return  # already running
 
         # Cache hit — nothing changed since last process, just (re-)display
-        if not self._settings_dirty and self._proc_image is not None:
+        if not self._settings_dirty and not self._mask_painted and self._proc_image is not None:
             self._showing_proc = True
             self._render_canvas(self._proc_image)
             self._status.set("Preview (cached)  —  click 'Show Original' to compare, or Export when done.")
@@ -1098,6 +1100,7 @@ class App:
     def _on_process_done(self, result: Image.Image) -> None:
         self._proc_image = result
         self._settings_dirty = False
+        self._mask_painted = False
         self._showing_proc = True
         self._set_processing(False)
         self._mask_mode.set(False)            # switch out of mask mode to show result
@@ -1113,11 +1116,13 @@ class App:
 
     def _on_mask_toggle(self) -> None:
         if self._mask_mode.get():
+            self._canvas.config(cursor="none")
             if self._slot_assignment is None or self._settings_dirty:
                 self._do_mask()
             else:
                 self._display_mask_overlay()
         else:
+            self._canvas.config(cursor="crosshair")
             self._last_cursor_canvasxy = None
             self._redraw_brush_cursor()
             self._refresh_display()
@@ -1252,6 +1257,7 @@ class App:
         """Write slot_val into a circular brush region of _slot_assignment."""
         if self._slot_assignment is None:
             return
+        self._mask_painted = True
         H, W = self._slot_assignment.shape
         r  = max(1, self._brush_size.get())
         y0 = max(0, iy - r);  y1 = min(H, iy + r + 1)
@@ -1380,6 +1386,7 @@ class App:
         # Do NOT clear _proc_image — keep the cache intact for the next Preview click
         self._showing_proc = False
         self._mask_mode.set(False)
+        self._canvas.config(cursor="crosshair")
         self._last_cursor_canvasxy = None
         self._render_canvas(self._orig_image)
         self._status.set("Showing original image.")
@@ -1394,7 +1401,8 @@ class App:
             for s in self._color_slots if s.is_ready()
         ]
         return _process_image(image, slot_params, use_lab,
-                              edge_protect=edge_protect, smooth_mask=smooth_mask)
+                              edge_protect=edge_protect, smooth_mask=smooth_mask,
+                              assignment_override=self._slot_assignment)
 
     # ================================================================ export
 
