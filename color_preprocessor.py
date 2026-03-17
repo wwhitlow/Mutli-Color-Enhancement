@@ -654,6 +654,9 @@ class App:
         self._mask_painted: bool = False        # True → painted overrides need reprocess
         self._brush_cursor_id: "int | None" = None     # canvas item id for circle cursor
         self._last_cursor_canvasxy: "tuple | None" = None
+        self._disp_orig: "Image.Image | None" = None   # display-res cache of orig
+        self._disp_orig_zoom: float = 0.0              # zoom level of cached disp_orig
+        self._last_overlay_t: float = 0.0              # monotonic time of last overlay draw
         self._edge_protect_var: tk.IntVar | None = None
         self._smooth_var: tk.BooleanVar | None = None
         self._ep_label: ttk.Label | None = None
@@ -840,10 +843,21 @@ class App:
         self._proc_image = None
         self._showing_proc = False
         self._settings_dirty = True
-        self._zoom_idx = self._DEFAULT_ZOOM
+        self._disp_orig = None          # invalidate display-res cache
+        self._disp_orig_zoom = 0.0
+
+        # Auto-select a sensible default zoom for large images
+        w, h = self._orig_image.size
+        pixels = w * h
+        if pixels >= 16_000_000:        # 16 MP+  →  25 %
+            self._zoom_idx = 1
+        elif pixels >= 4_000_000:       # 4–16 MP →  50 %
+            self._zoom_idx = 3
+        else:
+            self._zoom_idx = self._DEFAULT_ZOOM
+
         self._render_canvas(self._orig_image)
         name = Path(path).name
-        w, h = self._orig_image.size
         self._status.set(f"Loaded {name}  ({w} × {h} px)  —  add color slots or use Auto-suggest.")
 
     # ================================================================ canvas
@@ -1120,7 +1134,7 @@ class App:
             if self._slot_assignment is None or self._settings_dirty:
                 self._do_mask()
             else:
-                self._display_mask_overlay()
+                self._display_mask_overlay(force=True)
         else:
             self._canvas.config(cursor="crosshair")
             self._last_cursor_canvasxy = None
@@ -1171,27 +1185,38 @@ class App:
             "Left-drag to paint  |  right-drag to erase  |  ◀▶ to change slot  |  Preview to apply."
         )
         if self._mask_mode.get():
-            self._display_mask_overlay()
+            self._display_mask_overlay(force=True)
 
     def _on_mask_error(self, exc: Exception) -> None:
         self._set_processing(False)
         self._status.set(f"Mask computation failed: {exc}")
         messagebox.showerror("Mask failed", str(exc))
 
-    def _display_mask_overlay(self) -> None:
+    def _display_mask_overlay(self, force: bool = False) -> None:
         if self._orig_image is None or self._slot_assignment is None:
             return
+        # Throttle to ~30 fps during rapid paint/drag events
+        import time
+        now = time.monotonic()
+        if not force and (now - self._last_overlay_t) < 0.033:
+            return
+        self._last_overlay_t = now
+
         n_slots = sum(1 for s in self._color_slots if s.is_ready())
-        # Work at display resolution for performance (especially during paint strokes)
         z = self._zoom()
         dw = max(1, int(self._orig_image.width  * z))
         dh = max(1, int(self._orig_image.height * z))
-        resample = Image.NEAREST if z >= 1 else Image.LANCZOS
-        small_orig   = self._orig_image.resize((dw, dh), resample)
+
+        # Reuse cached display-res original; rebuild only when zoom changes
+        if self._disp_orig is None or self._disp_orig_zoom != z:
+            resample = Image.NEAREST if z >= 1 else Image.LANCZOS
+            self._disp_orig = self._orig_image.resize((dw, dh), resample)
+            self._disp_orig_zoom = z
+
         small_assign = np.array(
             Image.fromarray(self._slot_assignment, mode="L").resize((dw, dh), Image.NEAREST)
         )
-        overlay = _make_mask_overlay(small_orig, small_assign, n_slots)
+        overlay = _make_mask_overlay(self._disp_orig, small_assign, n_slots)
         self._tk_image = ImageTk.PhotoImage(overlay)
         self._canvas.configure(scrollregion=(0, 0, dw, dh))
         self._canvas.delete("all")
@@ -1309,6 +1334,8 @@ class App:
             if len(self._mask_undo_stack) > 20:
                 self._mask_undo_stack.pop(0)
         self._stroke_pre = None
+        # Force a final redraw so the complete stroke is visible
+        self._display_mask_overlay(force=True)
 
     def _undo_mask(self) -> None:
         if not self._mask_mode.get() or not self._mask_undo_stack:
@@ -1317,7 +1344,7 @@ class App:
             return
         ys, xs, old_vals = self._mask_undo_stack.pop()
         self._slot_assignment[ys, xs] = old_vals
-        self._display_mask_overlay()
+        self._display_mask_overlay(force=True)
         n = len(self._mask_undo_stack)
         self._status.set(f"Undo applied.  {n} step{'s' if n != 1 else ''} remaining.")
 
