@@ -93,6 +93,18 @@ def rgb_to_lab(arr: xp.ndarray) -> xp.ndarray:
 _MAX_RGB_DIST = float(xp.sqrt(3 * 255**2))   # ≈ 441.7
 _MAX_LAB_DIST = float(xp.sqrt(100**2 + 255**2 + 255**2))  # ≈ 383 (generous)
 
+# Overlay colors for per-slot mask visualization (R, G, B)
+_SLOT_OVERLAY_COLORS = [
+    (255,  70,  70),   # red
+    ( 70, 210,  70),   # green
+    ( 70, 130, 255),   # blue
+    (255, 200,   0),   # yellow
+    (255,  70, 255),   # magenta
+    (  0, 210, 210),   # cyan
+    (255, 140,   0),   # orange
+    (160,   0, 255),   # purple
+]
+
 
 def kmeans_colors(image: Image.Image, k: int, max_iter: int = 25) -> list:
     """
@@ -363,6 +375,92 @@ def _morph_erode1(mask: xp.ndarray) -> xp.ndarray:
     return out
 
 
+def _compute_slot_assignment(
+    image: Image.Image,
+    slot_params: list,
+    use_lab: bool,
+    edge_protect: float = 0.0,
+    smooth_mask: bool = True,
+) -> np.ndarray:
+    """
+    Return an H×W uint8 array where each pixel holds the index of the winning
+    color slot (0-based), or 255 if no slot matched.
+    Uses the same distance / edge-protect / morph-closing logic as _process_image.
+    """
+    if not slot_params:
+        arr = np.array(image)
+        return np.full(arr.shape[:2], 255, dtype=np.uint8)
+
+    arr = xp.array(image, dtype=xp.uint8)
+    H, W = arr.shape[:2]
+    P = H * W
+    flat = arr.reshape(P, 3).astype(xp.float32)
+    max_dist = _MAX_LAB_DIST if use_lab else _MAX_RGB_DIST
+    flat_sp = rgb_to_lab(flat) if use_lab else flat
+
+    if edge_protect > 0.0:
+        lum_np = np.array(image.convert("L"), dtype=np.float32)
+        gx_np = np.zeros_like(lum_np)
+        gy_np = np.zeros_like(lum_np)
+        gx_np[:, 1:-1] = lum_np[:, 2:] - lum_np[:, :-2]
+        gy_np[1:-1, :] = lum_np[2:, :] - lum_np[:-2, :]
+        mag_np = np.hypot(gx_np, gy_np)
+        peak = float(mag_np.max()) or 1.0
+        edge_str = xp.array(mag_np / peak, dtype=xp.float32).reshape(P)
+    else:
+        edge_str = None
+
+    best_dist = xp.full(P, xp.inf, dtype=xp.float32)
+    best_idx  = xp.full(P, -1,    dtype=xp.int32)
+
+    for i, (sample_rgb, _target_rgb, tolerance) in enumerate(slot_params):
+        sample    = xp.array([sample_rgb], dtype=xp.float32)
+        sample_sp = rgb_to_lab(sample) if use_lab else sample
+        tol_base  = (tolerance / 100.0) * max_dist
+        d = xp.sqrt(xp.sum((flat_sp - sample_sp) ** 2, axis=1))
+
+        if edge_str is not None:
+            raw_match = d <= tol_base * (1.0 - edge_protect * edge_str)
+        else:
+            raw_match = d <= tol_base
+
+        if smooth_mask:
+            closed = _morph_erode1(_morph_dilate1(raw_match.reshape(H, W))).reshape(P)
+            better = closed & (d < best_dist)
+        else:
+            better = raw_match & (d < best_dist)
+
+        best_dist = xp.where(better, d, best_dist)
+        best_idx  = xp.where(better, i, best_idx)
+
+    # Move to CPU; remap -1 → 255
+    cpu = best_idx.get() if hasattr(best_idx, "get") else best_idx
+    raw = cpu.reshape(H, W).astype(np.int16)
+    return np.where(raw < 0, 255, raw).astype(np.uint8)
+
+
+def _make_mask_overlay(
+    orig: Image.Image,
+    slot_assignment: np.ndarray,   # H×W uint8: slot index or 255 = unmatched
+    slot_count: int,
+    alpha: int = 160,              # 0-255 overlay opacity
+) -> Image.Image:
+    """
+    Alpha-blend a per-slot colored overlay onto *orig*.
+    Each slot gets a distinct color from _SLOT_OVERLAY_COLORS.
+    Unmatched pixels show through at full opacity.
+    """
+    base = orig.convert("RGBA")
+    overlay_arr = np.zeros((*slot_assignment.shape, 4), dtype=np.uint8)
+    for i in range(slot_count):
+        color = _SLOT_OVERLAY_COLORS[i % len(_SLOT_OVERLAY_COLORS)]
+        mask = slot_assignment == i
+        overlay_arr[mask, :3] = color
+        overlay_arr[mask,  3] = alpha
+    overlay_img = Image.fromarray(overlay_arr, "RGBA")
+    return Image.alpha_composite(base, overlay_img).convert("RGB")
+
+
 # ---------------------------------------------------------------------------
 # ColorSlot widget
 # ---------------------------------------------------------------------------
@@ -539,6 +637,8 @@ class App:
 
         self._use_lab = tk.BooleanVar(value=True)
         self._live_prev = tk.BooleanVar(value=False)
+        self._mask_mode = tk.BooleanVar(value=False)
+        self._slot_assignment: "np.ndarray | None" = None
         self._edge_protect_var: tk.IntVar | None = None
         self._smooth_var: tk.BooleanVar | None = None
         self._ep_label: ttk.Label | None = None
@@ -562,6 +662,9 @@ class App:
         self._preview_btn = ttk.Button(tb, text="Preview", command=self._do_preview)
         self._preview_btn.pack(side="left", padx=2)
         ttk.Button(tb, text="Show Original",command=self._show_original).pack(side="left", padx=2)
+        ttk.Checkbutton(
+            tb, text="Show Mask", variable=self._mask_mode, command=self._on_mask_toggle,
+        ).pack(side="left", padx=2)
         ttk.Separator(tb, orient="vertical").pack(side="left", fill="y", padx=6)
         self._deskew_btn = ttk.Button(tb, text="Auto-Deskew", command=self._do_deskew)
         self._deskew_btn.pack(side="left", padx=2)
@@ -880,8 +983,12 @@ class App:
 
     def _slot_changed(self) -> None:
         self._settings_dirty = True
+        self._slot_assignment = None          # invalidate mask cache
         if self._live_prev.get() and self._orig_image is not None:
-            self._do_preview()
+            if self._mask_mode.get():
+                self._do_mask()
+            else:
+                self._do_preview()
 
     # ================================================================ processing
 
@@ -928,8 +1035,10 @@ class App:
     def _on_process_done(self, result: Image.Image) -> None:
         self._proc_image = result
         self._settings_dirty = False
+        self._slot_assignment = None          # new preview → old masks are stale
         self._showing_proc = True
         self._set_processing(False)
+        self._mask_mode.set(False)            # switch out of mask mode to show result
         self._render_canvas(result)
         self._status.set("Preview  —  click 'Show Original' to compare, or Export when done.")
 
@@ -937,6 +1046,74 @@ class App:
         self._set_processing(False)
         self._status.set(f"Processing failed: {exc}")
         messagebox.showerror("Processing failed", str(exc))
+
+    # ================================================================ mask
+
+    def _on_mask_toggle(self) -> None:
+        if self._mask_mode.get():
+            if self._slot_assignment is None or self._settings_dirty:
+                self._do_mask()
+            else:
+                self._display_mask_overlay()
+        else:
+            self._refresh_display()
+            self._status.set("Mask mode off.  Preview to see processed result, or Export.")
+
+    def _do_mask(self) -> None:
+        if self._orig_image is None:
+            messagebox.showwarning("No image", "Open an image first.")
+            return
+        if self._processing:
+            return
+
+        use_lab      = self._use_lab.get()
+        edge_protect = self._edge_protect_var.get() / 100.0 if self._edge_protect_var else 0.0
+        smooth_mask  = self._smooth_var.get() if self._smooth_var else True
+        slot_params  = [
+            (s.sample_rgb, s.target_rgb, s.tolerance)
+            for s in self._color_slots if s.is_ready()
+        ]
+        image = self._orig_image
+
+        self._set_processing(True)
+        self._status.set("Computing mask…")
+        self.root.update_idletasks()
+
+        def _worker():
+            try:
+                assignment = _compute_slot_assignment(
+                    image, slot_params, use_lab, edge_protect, smooth_mask
+                )
+            except Exception as exc:
+                self.root.after(0, lambda: self._on_mask_error(exc))
+                return
+            self.root.after(0, lambda: self._on_mask_done(assignment))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_mask_done(self, assignment: np.ndarray) -> None:
+        self._slot_assignment = assignment
+        self._set_processing(False)
+        n_matched = int((assignment != 255).sum())
+        pct = 100.0 * n_matched / assignment.size
+        self._status.set(
+            f"Mask ready — {n_matched:,} px matched ({pct:.1f}%).  "
+            "Adjust sliders to refine; toggle 'Show Mask' off to preview result."
+        )
+        if self._mask_mode.get():
+            self._display_mask_overlay()
+
+    def _on_mask_error(self, exc: Exception) -> None:
+        self._set_processing(False)
+        self._status.set(f"Mask computation failed: {exc}")
+        messagebox.showerror("Mask failed", str(exc))
+
+    def _display_mask_overlay(self) -> None:
+        if self._orig_image is None or self._slot_assignment is None:
+            return
+        n_slots = sum(1 for s in self._color_slots if s.is_ready())
+        overlay = _make_mask_overlay(self._orig_image, self._slot_assignment, n_slots)
+        self._render_canvas(overlay)
 
     # ================================================================ deskew
 
@@ -1002,6 +1179,7 @@ class App:
             return
         # Do NOT clear _proc_image — keep the cache intact for the next Preview click
         self._showing_proc = False
+        self._mask_mode.set(False)
         self._render_canvas(self._orig_image)
         self._status.set("Showing original image.")
 
