@@ -663,32 +663,45 @@ class App:
         self.root.columnconfigure(1, weight=0)
         self.root.rowconfigure(1, weight=1)
 
-        # ── Toolbar ───────────────────────────────────────────────────────────
+        # ── Toolbar (two rows) ────────────────────────────────────────────────
         tb = ttk.Frame(self.root)
-        tb.grid(row=0, column=0, columnspan=2, sticky="ew", padx=4, pady=4)
+        tb.grid(row=0, column=0, columnspan=2, sticky="ew", padx=4, pady=(4, 0))
 
-        ttk.Button(tb, text="Open Image",   command=self._open).pack(side="left", padx=2)
-        ttk.Separator(tb, orient="vertical").pack(side="left", fill="y", padx=6)
-        self._preview_btn = ttk.Button(tb, text="Preview", command=self._do_preview)
+        # Row 1 — primary workflow actions
+        tb1 = ttk.Frame(tb)
+        tb1.pack(fill="x", side="top", pady=(0, 2))
+
+        ttk.Button(tb1, text="Open Image",    command=self._open).pack(side="left", padx=2)
+        ttk.Separator(tb1, orient="vertical").pack(side="left", fill="y", padx=6)
+        self._preview_btn = ttk.Button(tb1, text="Preview", command=self._do_preview)
         self._preview_btn.pack(side="left", padx=2)
-        ttk.Button(tb, text="Show Original",command=self._show_original).pack(side="left", padx=2)
+        ttk.Button(tb1, text="Show Original", command=self._show_original).pack(side="left", padx=2)
         ttk.Checkbutton(
-            tb, text="Show Mask", variable=self._mask_mode, command=self._on_mask_toggle,
+            tb1, text="Show Mask", variable=self._mask_mode, command=self._on_mask_toggle,
         ).pack(side="left", padx=2)
-        ttk.Separator(tb, orient="vertical").pack(side="left", fill="y", padx=6)
-        self._deskew_btn = ttk.Button(tb, text="Auto-Deskew", command=self._do_deskew)
+        ttk.Separator(tb1, orient="vertical").pack(side="left", fill="y", padx=6)
+        self._deskew_btn = ttk.Button(tb1, text="Auto-Deskew", command=self._do_deskew)
         self._deskew_btn.pack(side="left", padx=2)
-        ttk.Separator(tb, orient="vertical").pack(side="left", fill="y", padx=6)
-        ttk.Button(tb, text="Export…",      command=self._export).pack(side="left", padx=2)
-        ttk.Separator(tb, orient="vertical").pack(side="left", fill="y", padx=6)
-        ttk.Checkbutton(tb, text="LAB color space", variable=self._use_lab).pack(side="left", padx=2)
-        ttk.Checkbutton(tb, text="Live preview",    variable=self._live_prev).pack(side="left", padx=2)
-        ttk.Separator(tb, orient="vertical").pack(side="left", fill="y", padx=6)
-        ttk.Label(tb, text="Edge protect:").pack(side="left", padx=(0, 2))
+        ttk.Separator(tb1, orient="vertical").pack(side="left", fill="y", padx=6)
+        ttk.Button(tb1, text="Export…",       command=self._export).pack(side="left", padx=2)
+        ttk.Separator(tb1, orient="vertical").pack(side="left", fill="y", padx=6)
+        ttk.Button(tb1, text="−", width=2, command=self._zoom_out).pack(side="left")
+        self._zoom_label = ttk.Label(tb1, text="100%", width=5, anchor="center")
+        self._zoom_label.pack(side="left")
+        ttk.Button(tb1, text="+", width=2, command=self._zoom_in).pack(side="left")
+
+        # Row 2 — processing settings and paint tools
+        tb2 = ttk.Frame(tb)
+        tb2.pack(fill="x", side="top", pady=(0, 4))
+
+        ttk.Checkbutton(tb2, text="LAB color space", variable=self._use_lab).pack(side="left", padx=2)
+        ttk.Checkbutton(tb2, text="Live preview",    variable=self._live_prev).pack(side="left", padx=2)
+        ttk.Separator(tb2, orient="vertical").pack(side="left", fill="y", padx=6)
+        ttk.Label(tb2, text="Edge protect:").pack(side="left", padx=(0, 2))
         self._edge_protect_var = tk.IntVar(value=0)
-        self._ep_label = ttk.Label(tb, text=" 0%", width=4)
+        self._ep_label = ttk.Label(tb2, text=" 0%", width=4)
         ttk.Scale(
-            tb, from_=0, to=100, orient="horizontal", length=80,
+            tb2, from_=0, to=100, orient="horizontal", length=80,
             variable=self._edge_protect_var,
             command=lambda _: (
                 self._ep_label.config(text=f"{self._edge_protect_var.get():2d}%"),
@@ -698,23 +711,18 @@ class App:
         self._ep_label.pack(side="left", padx=(0, 4))
         self._smooth_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            tb, text="Smooth", variable=self._smooth_var, command=self._slot_changed,
+            tb2, text="Smooth", variable=self._smooth_var, command=self._slot_changed,
         ).pack(side="left", padx=2)
-        ttk.Separator(tb, orient="vertical").pack(side="left", fill="y", padx=6)
-        ttk.Label(tb, text="Brush:").pack(side="left", padx=(0, 2))
+        ttk.Separator(tb2, orient="vertical").pack(side="left", fill="y", padx=6)
+        ttk.Label(tb2, text="Brush:").pack(side="left", padx=(0, 2))
         ttk.Scale(
-            tb, from_=1, to=50, orient="horizontal", length=55,
+            tb2, from_=1, to=50, orient="horizontal", length=60,
             variable=self._brush_size,
         ).pack(side="left")
-        ttk.Button(tb, text="◀", width=2, command=self._prev_paint_slot).pack(side="left", padx=(4, 0))
-        self._paint_slot_label = ttk.Label(tb, text="—", width=9, anchor="center")
+        ttk.Button(tb2, text="◀", width=2, command=self._prev_paint_slot).pack(side="left", padx=(6, 0))
+        self._paint_slot_label = ttk.Label(tb2, text="—", width=9, anchor="center")
         self._paint_slot_label.pack(side="left")
-        ttk.Button(tb, text="▶", width=2, command=self._next_paint_slot).pack(side="left", padx=(0, 4))
-        ttk.Separator(tb, orient="vertical").pack(side="left", fill="y", padx=6)
-        ttk.Button(tb, text="−", width=2, command=self._zoom_out).pack(side="left")
-        self._zoom_label = ttk.Label(tb, text="100%", width=5, anchor="center")
-        self._zoom_label.pack(side="left")
-        ttk.Button(tb, text="+", width=2, command=self._zoom_in).pack(side="left")
+        ttk.Button(tb2, text="▶", width=2, command=self._next_paint_slot).pack(side="left", padx=(0, 4))
 
         # ── Image canvas ──────────────────────────────────────────────────────
         cf = ttk.Frame(self.root)
