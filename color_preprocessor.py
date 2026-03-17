@@ -163,10 +163,11 @@ def kmeans_colors(image: Image.Image, k: int, max_iter: int = 25) -> list:
 
 def _process_image(
     image: Image.Image,
-    slot_params: list,       # [(sample_rgb, target_rgb, tolerance), ...]
+    slot_params: list,            # [(sample_rgb, target_rgb, tolerance), ...]
     use_lab: bool,
     edge_protect: float = 0.0,   # 0.0–1.0; reduces tolerance near edges
-    smooth_mask: bool = True,    # morphological closing to fill patch holes
+    smooth_mask: bool = True,     # morphological closing to fill patch holes
+    assignment_override: "np.ndarray | None" = None,  # H×W uint8; 255=no override
 ) -> Image.Image:
     """
     Remap pixels in *image* according to the color slot settings.
@@ -234,6 +235,12 @@ def _process_image(
 
         best_dist = xp.where(better, d, best_dist)
         best_idx  = xp.where(better, i, best_idx)
+
+    # Apply hand-painted overrides (wins over distance matching)
+    if assignment_override is not None:
+        ov = xp.array(assignment_override.reshape(P).astype(np.int32))
+        has_ov = ov != 255
+        best_idx = xp.where(has_ov, ov, best_idx)
 
     has_match = best_idx >= 0
     result = flat.astype(xp.uint8).copy()
@@ -639,6 +646,9 @@ class App:
         self._live_prev = tk.BooleanVar(value=False)
         self._mask_mode = tk.BooleanVar(value=False)
         self._slot_assignment: "np.ndarray | None" = None
+        self._paint_slot_idx: int = 0
+        self._brush_size = tk.IntVar(value=10)
+        self._paint_slot_label: ttk.Label | None = None
         self._edge_protect_var: tk.IntVar | None = None
         self._smooth_var: tk.BooleanVar | None = None
         self._ep_label: ttk.Label | None = None
@@ -691,6 +701,16 @@ class App:
             tb, text="Smooth", variable=self._smooth_var, command=self._slot_changed,
         ).pack(side="left", padx=2)
         ttk.Separator(tb, orient="vertical").pack(side="left", fill="y", padx=6)
+        ttk.Label(tb, text="Brush:").pack(side="left", padx=(0, 2))
+        ttk.Scale(
+            tb, from_=1, to=50, orient="horizontal", length=55,
+            variable=self._brush_size,
+        ).pack(side="left")
+        ttk.Button(tb, text="◀", width=2, command=self._prev_paint_slot).pack(side="left", padx=(4, 0))
+        self._paint_slot_label = ttk.Label(tb, text="—", width=9, anchor="center")
+        self._paint_slot_label.pack(side="left")
+        ttk.Button(tb, text="▶", width=2, command=self._next_paint_slot).pack(side="left", padx=(0, 4))
+        ttk.Separator(tb, orient="vertical").pack(side="left", fill="y", padx=6)
         ttk.Button(tb, text="−", width=2, command=self._zoom_out).pack(side="left")
         self._zoom_label = ttk.Label(tb, text="100%", width=5, anchor="center")
         self._zoom_label.pack(side="left")
@@ -711,11 +731,14 @@ class App:
         v_sb.grid(row=0, column=1, sticky="ns")
         h_sb.grid(row=1, column=0, sticky="ew")
 
-        self._canvas.bind("<Button-1>",   self._canvas_click)
-        self._canvas.bind("<Motion>",     self._canvas_hover)
-        self._canvas.bind("<MouseWheel>", self._canvas_scroll_zoom)  # macOS / Win
-        self._canvas.bind("<Button-4>",   lambda _e: self._zoom_in())   # Linux scroll up
-        self._canvas.bind("<Button-5>",   lambda _e: self._zoom_out())  # Linux scroll down
+        self._canvas.bind("<Button-1>",        self._canvas_click)
+        self._canvas.bind("<B1-Motion>",       self._canvas_paint_drag)
+        self._canvas.bind("<Button-3>",        self._canvas_erase_start)
+        self._canvas.bind("<B3-Motion>",       self._canvas_erase_drag)
+        self._canvas.bind("<Motion>",          self._canvas_hover)
+        self._canvas.bind("<MouseWheel>",      self._canvas_scroll_zoom)  # macOS / Win
+        self._canvas.bind("<Button-4>",        lambda _e: self._zoom_in())   # Linux scroll up
+        self._canvas.bind("<Button-5>",        lambda _e: self._zoom_out())  # Linux scroll down
 
         # ── Status bar ────────────────────────────────────────────────────────
         self._status = tk.StringVar(value="Open an image to begin.")
@@ -862,6 +885,14 @@ class App:
         if self._orig_image is None:
             return
         ix, iy = self._canvas_xy(event)
+
+        # In mask mode, left-click paints
+        if self._mask_mode.get():
+            if self._slot_assignment is not None:
+                self._paint_at(ix, iy, self._get_paint_slot_val())
+                self._display_mask_overlay()
+            return
+
         rgb = self._pixel_at(ix, iy)
         if rgb is None:
             return
@@ -887,6 +918,15 @@ class App:
         if self._orig_image is None:
             return
         ix, iy = self._canvas_xy(event)
+        if self._mask_mode.get():
+            ready = [s for s in self._color_slots if s.is_ready()]
+            if ready:
+                idx = self._paint_slot_idx % len(ready)
+                slot = ready[idx]
+                self._status.set(
+                    f"({ix}, {iy})  —  left-drag: paint Color {slot.index + 1}  |  right-drag: erase  |  brush: {self._brush_size.get()}px"
+                )
+            return
         rgb = self._pixel_at(ix, iy)
         if rgb is None:
             return
@@ -1007,10 +1047,11 @@ class App:
             return
 
         # Snapshot settings on the main thread before handing off to worker
-        use_lab = self._use_lab.get()
+        use_lab      = self._use_lab.get()
         edge_protect = self._edge_protect_var.get() / 100.0 if self._edge_protect_var else 0.0
         smooth_mask  = self._smooth_var.get() if self._smooth_var else True
-        slot_params = [
+        assignment_override = self._slot_assignment  # honour any painted overrides
+        slot_params  = [
             (s.sample_rgb, s.target_rgb, s.tolerance)
             for s in self._color_slots if s.is_ready()
         ]
@@ -1024,7 +1065,8 @@ class App:
             try:
                 result = _process_image(image, slot_params, use_lab,
                                         edge_protect=edge_protect,
-                                        smooth_mask=smooth_mask)
+                                        smooth_mask=smooth_mask,
+                                        assignment_override=assignment_override)
             except Exception as exc:
                 self.root.after(0, lambda: self._on_process_error(exc))
                 return
@@ -1094,11 +1136,12 @@ class App:
     def _on_mask_done(self, assignment: np.ndarray) -> None:
         self._slot_assignment = assignment
         self._set_processing(False)
+        self._update_paint_slot_label()
         n_matched = int((assignment != 255).sum())
         pct = 100.0 * n_matched / assignment.size
         self._status.set(
             f"Mask ready — {n_matched:,} px matched ({pct:.1f}%).  "
-            "Adjust sliders to refine; toggle 'Show Mask' off to preview result."
+            "Left-drag to paint  |  right-drag to erase  |  ◀▶ to change slot  |  Preview to apply."
         )
         if self._mask_mode.get():
             self._display_mask_overlay()
@@ -1112,8 +1155,96 @@ class App:
         if self._orig_image is None or self._slot_assignment is None:
             return
         n_slots = sum(1 for s in self._color_slots if s.is_ready())
-        overlay = _make_mask_overlay(self._orig_image, self._slot_assignment, n_slots)
-        self._render_canvas(overlay)
+        # Work at display resolution for performance (especially during paint strokes)
+        z = self._zoom()
+        dw = max(1, int(self._orig_image.width  * z))
+        dh = max(1, int(self._orig_image.height * z))
+        resample = Image.NEAREST if z >= 1 else Image.LANCZOS
+        small_orig   = self._orig_image.resize((dw, dh), resample)
+        small_assign = np.array(
+            Image.fromarray(self._slot_assignment, mode="L").resize((dw, dh), Image.NEAREST)
+        )
+        overlay = _make_mask_overlay(small_orig, small_assign, n_slots)
+        self._tk_image = ImageTk.PhotoImage(overlay)
+        self._canvas.configure(scrollregion=(0, 0, dw, dh))
+        self._canvas.delete("all")
+        self._canvas.create_image(0, 0, anchor="nw", image=self._tk_image)
+        self._zoom_label.config(text=f"{int(z * 100)}%")
+
+    # ================================================================ mask painting
+
+    def _get_paint_slot_val(self) -> int:
+        """Return the slot-assignment value to write when painting (0-based index, or 255)."""
+        ready = [s for s in self._color_slots if s.is_ready()]
+        if not ready:
+            return 255
+        self._paint_slot_idx = self._paint_slot_idx % len(ready)
+        return self._paint_slot_idx
+
+    def _prev_paint_slot(self) -> None:
+        ready = [s for s in self._color_slots if s.is_ready()]
+        if not ready:
+            return
+        self._paint_slot_idx = (self._paint_slot_idx - 1) % len(ready)
+        self._update_paint_slot_label()
+
+    def _next_paint_slot(self) -> None:
+        ready = [s for s in self._color_slots if s.is_ready()]
+        if not ready:
+            return
+        self._paint_slot_idx = (self._paint_slot_idx + 1) % len(ready)
+        self._update_paint_slot_label()
+
+    def _update_paint_slot_label(self) -> None:
+        if self._paint_slot_label is None:
+            return
+        ready = [s for s in self._color_slots if s.is_ready()]
+        if not ready:
+            self._paint_slot_label.config(text="—")
+            return
+        idx   = self._paint_slot_idx % len(ready)
+        slot  = ready[idx]
+        color = _SLOT_OVERLAY_COLORS[idx % len(_SLOT_OVERLAY_COLORS)]
+        hex_c = rgb_to_hex(*color)
+        self._paint_slot_label.config(
+            text=f"Color {slot.index + 1}",
+            foreground=hex_c,
+        )
+
+    def _paint_at(self, ix: int, iy: int, slot_val: int) -> None:
+        """Write slot_val into a circular brush region of _slot_assignment."""
+        if self._slot_assignment is None:
+            return
+        H, W = self._slot_assignment.shape
+        r  = max(1, self._brush_size.get())
+        y0 = max(0, iy - r);  y1 = min(H, iy + r + 1)
+        x0 = max(0, ix - r);  x1 = min(W, ix + r + 1)
+        if y0 >= y1 or x0 >= x1:
+            return
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        circle = (yy - iy) ** 2 + (xx - ix) ** 2 <= r ** 2
+        self._slot_assignment[y0:y1, x0:x1][circle] = slot_val
+
+    def _canvas_paint_drag(self, event) -> None:
+        if not self._mask_mode.get() or self._slot_assignment is None:
+            return
+        ix, iy = self._canvas_xy(event)
+        self._paint_at(ix, iy, self._get_paint_slot_val())
+        self._display_mask_overlay()
+
+    def _canvas_erase_start(self, event) -> None:
+        if not self._mask_mode.get() or self._slot_assignment is None:
+            return
+        ix, iy = self._canvas_xy(event)
+        self._paint_at(ix, iy, 255)
+        self._display_mask_overlay()
+
+    def _canvas_erase_drag(self, event) -> None:
+        if not self._mask_mode.get() or self._slot_assignment is None:
+            return
+        ix, iy = self._canvas_xy(event)
+        self._paint_at(ix, iy, 255)
+        self._display_mask_overlay()
 
     # ================================================================ deskew
 
