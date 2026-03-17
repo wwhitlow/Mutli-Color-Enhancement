@@ -649,6 +649,10 @@ class App:
         self._paint_slot_idx: int = 0
         self._brush_size = tk.IntVar(value=10)
         self._paint_slot_label: ttk.Label | None = None
+        self._mask_undo_stack: list = []        # list of (ys, xs, old_vals) diffs
+        self._stroke_pre: "np.ndarray | None" = None   # pre-stroke copy for undo
+        self._brush_cursor_id: "int | None" = None     # canvas item id for circle cursor
+        self._last_cursor_canvasxy: "tuple | None" = None
         self._edge_protect_var: tk.IntVar | None = None
         self._smooth_var: tk.BooleanVar | None = None
         self._ep_label: ttk.Label | None = None
@@ -741,8 +745,10 @@ class App:
 
         self._canvas.bind("<Button-1>",        self._canvas_click)
         self._canvas.bind("<B1-Motion>",       self._canvas_paint_drag)
+        self._canvas.bind("<ButtonRelease-1>", self._canvas_stroke_end)
         self._canvas.bind("<Button-3>",        self._canvas_erase_start)
         self._canvas.bind("<B3-Motion>",       self._canvas_erase_drag)
+        self._canvas.bind("<ButtonRelease-3>", self._canvas_stroke_end)
         self._canvas.bind("<Motion>",          self._canvas_hover)
         self._canvas.bind("<MouseWheel>",      self._canvas_scroll_zoom)  # macOS / Win
         self._canvas.bind("<Button-4>",        lambda _e: self._zoom_in())   # Linux scroll up
@@ -808,6 +814,8 @@ class App:
         self.root.bind("<Control-s>", lambda _: self._export())
         self.root.bind("<Control-S>", lambda _: self._export())
         self.root.bind("<Escape>",    lambda _: self._cancel_sample_mode())
+        self.root.bind("<Control-z>", lambda _: self._undo_mask())
+        self.root.bind("<Control-Z>", lambda _: self._undo_mask())
 
     # ================================================================ image
 
@@ -894,9 +902,10 @@ class App:
             return
         ix, iy = self._canvas_xy(event)
 
-        # In mask mode, left-click paints
+        # In mask mode, left-click starts a paint stroke
         if self._mask_mode.get():
             if self._slot_assignment is not None:
+                self._stroke_pre = self._slot_assignment.copy()
                 self._paint_at(ix, iy, self._get_paint_slot_val())
                 self._display_mask_overlay()
             return
@@ -927,6 +936,9 @@ class App:
             return
         ix, iy = self._canvas_xy(event)
         if self._mask_mode.get():
+            self._last_cursor_canvasxy = (self._canvas.canvasx(event.x),
+                                          self._canvas.canvasy(event.y))
+            self._redraw_brush_cursor()
             ready = [s for s in self._color_slots if s.is_ready()]
             if ready:
                 idx = self._paint_slot_idx % len(ready)
@@ -1032,6 +1044,7 @@ class App:
     def _slot_changed(self) -> None:
         self._settings_dirty = True
         self._slot_assignment = None          # invalidate mask cache
+        self._mask_undo_stack.clear()         # painted edits are now meaningless
         if self._live_prev.get() and self._orig_image is not None:
             if self._mask_mode.get():
                 self._do_mask()
@@ -1085,7 +1098,6 @@ class App:
     def _on_process_done(self, result: Image.Image) -> None:
         self._proc_image = result
         self._settings_dirty = False
-        self._slot_assignment = None          # new preview → old masks are stale
         self._showing_proc = True
         self._set_processing(False)
         self._mask_mode.set(False)            # switch out of mask mode to show result
@@ -1106,6 +1118,8 @@ class App:
             else:
                 self._display_mask_overlay()
         else:
+            self._last_cursor_canvasxy = None
+            self._redraw_brush_cursor()
             self._refresh_display()
             self._status.set("Mask mode off.  Preview to see processed result, or Export.")
 
@@ -1178,8 +1192,23 @@ class App:
         self._canvas.delete("all")
         self._canvas.create_image(0, 0, anchor="nw", image=self._tk_image)
         self._zoom_label.config(text=f"{int(z * 100)}%")
+        self._redraw_brush_cursor()
 
     # ================================================================ mask painting
+
+    def _redraw_brush_cursor(self) -> None:
+        """Draw a dashed circle showing brush size. Called after every canvas update."""
+        if self._brush_cursor_id is not None:
+            self._canvas.delete(self._brush_cursor_id)
+            self._brush_cursor_id = None
+        if not self._mask_mode.get() or self._last_cursor_canvasxy is None:
+            return
+        cx, cy = self._last_cursor_canvasxy
+        r = max(1, self._brush_size.get()) * self._zoom()
+        self._brush_cursor_id = self._canvas.create_oval(
+            cx - r, cy - r, cx + r, cy + r,
+            outline="white", width=1, dash=(4, 4),
+        )
 
     def _get_paint_slot_val(self) -> int:
         """Return the slot-assignment value to write when painting (0-based index, or 255)."""
@@ -1236,6 +1265,8 @@ class App:
     def _canvas_paint_drag(self, event) -> None:
         if not self._mask_mode.get() or self._slot_assignment is None:
             return
+        self._last_cursor_canvasxy = (self._canvas.canvasx(event.x),
+                                      self._canvas.canvasy(event.y))
         ix, iy = self._canvas_xy(event)
         self._paint_at(ix, iy, self._get_paint_slot_val())
         self._display_mask_overlay()
@@ -1243,6 +1274,9 @@ class App:
     def _canvas_erase_start(self, event) -> None:
         if not self._mask_mode.get() or self._slot_assignment is None:
             return
+        self._stroke_pre = self._slot_assignment.copy()
+        self._last_cursor_canvasxy = (self._canvas.canvasx(event.x),
+                                      self._canvas.canvasy(event.y))
         ix, iy = self._canvas_xy(event)
         self._paint_at(ix, iy, 255)
         self._display_mask_overlay()
@@ -1250,9 +1284,36 @@ class App:
     def _canvas_erase_drag(self, event) -> None:
         if not self._mask_mode.get() or self._slot_assignment is None:
             return
+        self._last_cursor_canvasxy = (self._canvas.canvasx(event.x),
+                                      self._canvas.canvasy(event.y))
         ix, iy = self._canvas_xy(event)
         self._paint_at(ix, iy, 255)
         self._display_mask_overlay()
+
+    def _canvas_stroke_end(self, event) -> None:
+        """Commit the current paint/erase stroke to the undo stack."""
+        if not self._mask_mode.get() or self._stroke_pre is None or self._slot_assignment is None:
+            self._stroke_pre = None
+            return
+        changed = self._stroke_pre != self._slot_assignment
+        ys, xs = np.where(changed)
+        if len(ys):
+            old_vals = self._stroke_pre[ys, xs]
+            self._mask_undo_stack.append((ys, xs, old_vals))
+            if len(self._mask_undo_stack) > 20:
+                self._mask_undo_stack.pop(0)
+        self._stroke_pre = None
+
+    def _undo_mask(self) -> None:
+        if not self._mask_mode.get() or not self._mask_undo_stack:
+            return
+        if self._slot_assignment is None:
+            return
+        ys, xs, old_vals = self._mask_undo_stack.pop()
+        self._slot_assignment[ys, xs] = old_vals
+        self._display_mask_overlay()
+        n = len(self._mask_undo_stack)
+        self._status.set(f"Undo applied.  {n} step{'s' if n != 1 else ''} remaining.")
 
     # ================================================================ deskew
 
@@ -1319,6 +1380,7 @@ class App:
         # Do NOT clear _proc_image — keep the cache intact for the next Preview click
         self._showing_proc = False
         self._mask_mode.set(False)
+        self._last_cursor_canvasxy = None
         self._render_canvas(self._orig_image)
         self._status.set("Showing original image.")
 
