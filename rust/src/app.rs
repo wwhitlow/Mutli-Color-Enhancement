@@ -1052,8 +1052,11 @@ impl eframe::App for App {
 // ---------------------------------------------------------------------------
 
 fn pixels_to_texture(ctx: &egui::Context, pixels: &[[u8; 3]], w: usize, h: usize) -> TextureHandle {
+    // Parallel RGBA packing: build Vec<Color32> ([u8;4]) from [u8;3] source.
+    // Color32 is repr(transparent) [u8;4] with layout [r,g,b,a].
+    use rayon::prelude::*;
     let flat: Vec<egui::Color32> = pixels
-        .iter()
+        .par_iter()
         .map(|p| Color32::from_rgb(p[0], p[1], p[2]))
         .collect();
     let color_image = ColorImage {
