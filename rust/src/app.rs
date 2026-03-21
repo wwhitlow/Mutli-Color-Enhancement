@@ -88,6 +88,7 @@ pub struct App {
     smooth_mask: bool,
     brush_size: f32,    // display pixels
     paint_slot_idx: usize,
+    suggest_k: usize,   // K-means cluster count
 
     // Slots
     slots: Vec<ColorSlot>,
@@ -128,6 +129,7 @@ impl App {
             smooth_mask: true,
             brush_size: 20.0,
             paint_slot_idx: 0,
+            suggest_k: 6,
             slots,
             rx,
             tx,
@@ -194,8 +196,8 @@ impl App {
     }
 
     fn upload_orig_texture(&mut self, ctx: &egui::Context) {
-        if let Some(ref pixels) = self.orig_pixels {
-            self.canvas_texture = Some(pixels_to_texture(ctx, pixels, self.img_w, self.img_h));
+        if let Some(ref pixels) = self.orig_pixels.clone() {
+            set_canvas_texture(&mut self.canvas_texture, ctx, pixels, self.img_w, self.img_h);
         }
     }
 
@@ -340,7 +342,7 @@ impl App {
     fn poll_worker(&mut self, ctx: &egui::Context) {
         match self.rx.try_recv() {
             Ok(WorkerMsg::Preview(pixels)) => {
-                self.canvas_texture = Some(pixels_to_texture(ctx, &pixels, self.img_w, self.img_h));
+                set_canvas_texture(&mut self.canvas_texture, ctx, &pixels, self.img_w, self.img_h);
                 self.proc_pixels = Some(pixels);
                 self.processing = false;
                 self.settings_dirty = false;
@@ -404,8 +406,7 @@ impl App {
                 } else {
                     1.0
                 };
-                self.canvas_texture =
-                    Some(pixels_to_texture(ctx, &pixels, w, h));
+                set_canvas_texture(&mut self.canvas_texture, ctx, &pixels, w, h);
                 self.orig_pixels = Some(pixels);
                 self.img_w = w;
                 self.img_h = h;
@@ -445,7 +446,7 @@ impl App {
         };
         let n_slots = self.slots.iter().filter(|s| s.is_ready()).count();
         let overlay = make_mask_overlay(&orig, &assignment, n_slots, 0.6);
-        self.canvas_texture = Some(pixels_to_texture(ctx, &overlay, self.img_w, self.img_h));
+        set_canvas_texture(&mut self.canvas_texture, ctx, &overlay, self.img_w, self.img_h);
     }
 
     // -----------------------------------------------------------------------
@@ -683,8 +684,7 @@ impl eframe::App for App {
                         if self.show_original || self.proc_pixels.is_none() {
                             self.upload_orig_texture(ctx);
                         } else if let Some(ref p) = self.proc_pixels.clone() {
-                            self.canvas_texture =
-                                Some(pixels_to_texture(ctx, p, self.img_w, self.img_h));
+                            set_canvas_texture(&mut self.canvas_texture, ctx, p, self.img_w, self.img_h);
                         }
                         self.status = "Mask mode off.".to_string();
                     }
@@ -716,6 +716,8 @@ impl eframe::App for App {
                 ui.separator();
 
                 // ---- Auto-Suggest ----
+                ui.label("K:");
+                ui.add(egui::DragValue::new(&mut self.suggest_k).range(1..=16).speed(0.1));
                 if ui
                     .add_enabled(
                         !self.processing && self.orig_pixels.is_some(),
@@ -723,7 +725,7 @@ impl eframe::App for App {
                     )
                     .clicked()
                 {
-                    self.start_autosuggest(6, ctx);
+                    self.start_autosuggest(self.suggest_k, ctx);
                 }
 
                 ui.separator();
@@ -845,11 +847,16 @@ impl eframe::App for App {
                                     ui.label(format!("{}:", slot.label));
 
                                     // Eye-dropper button
-                                    let picking = false; // placeholder; real picking via canvas click
-                                    let _ = picking;
-                                    if ui.button("Pick").clicked() {
-                                        // Set picking mode — will be handled on next canvas click
-                                        // We store globally on App but need index
+                                    let is_picking = self.picking_slot == Some(i);
+                                    let pick_label = if is_picking { "⬛ picking…" } else { "Pick" };
+                                    if ui.button(pick_label).clicked() {
+                                        self.picking_slot = if is_picking { None } else { Some(i) };
+                                        if self.picking_slot.is_some() {
+                                            self.status = format!(
+                                                "Click on the image to sample color for '{}'.",
+                                                slot.label
+                                            );
+                                        }
                                     }
 
                                     // Sample swatch (read-only display)
@@ -939,12 +946,16 @@ impl eframe::App for App {
             }
 
             // Draw the image
-            if let Some(ref tex) = self.canvas_texture {
+            if let Some(ref tex) = self.canvas_texture.clone() {
                 let disp_w = self.img_w as f32 * self.zoom;
                 let disp_h = self.img_h as f32 * self.zoom;
                 let img_rect =
                     Rect::from_center_size(canvas_rect.center(), Vec2::new(disp_w, disp_h));
-                let response = ui.allocate_rect(img_rect, egui::Sense::click_and_drag());
+
+                // Allocate the full canvas area for interaction so clicks in the
+                // grey border area (zoomed-out images) are still captured.
+                let response = ui.allocate_rect(canvas_rect, egui::Sense::click_and_drag());
+
                 ui.painter().image(
                     tex.id(),
                     img_rect,
@@ -972,34 +983,29 @@ impl eframe::App for App {
                     }
                 }
 
-                // Mouse interaction
-                if response.is_pointer_button_down_on() {
-                    let erase = ui.input(|i| i.modifiers.shift);
-
-                    if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-                        if self.mask_mode && self.slot_assignment.is_some() {
-                            // Start stroke on first contact
-                            if self.stroke_pre.is_none() {
-                                self.stroke_begin();
-                            }
-                            self.paint_at(pos, erase, canvas_rect, ctx);
-                        } else if let Some(slot_idx) = self.picking_slot {
-                            // Eye-dropper: map click to image pixel
-                            let disp_w = self.img_w as f32 * self.zoom;
-                            let disp_h = self.img_h as f32 * self.zoom;
-                            let ir = Rect::from_center_size(
-                                canvas_rect.center(),
-                                Vec2::new(disp_w, disp_h),
-                            );
-                            let ix = ((pos.x - ir.left()) / disp_w * self.img_w as f32) as usize;
-                            let iy = ((pos.y - ir.top()) / disp_h * self.img_h as f32) as usize;
-                            if ix < self.img_w && iy < self.img_h {
+                // ---- Eye-dropper (fires on click release) ----
+                if let Some(slot_idx) = self.picking_slot {
+                    if response.clicked() {
+                        if let Some(pos) = response.interact_pointer_pos() {
+                            let ix = ((pos.x - img_rect.left()) / disp_w * self.img_w as f32)
+                                .round() as i32;
+                            let iy = ((pos.y - img_rect.top()) / disp_h * self.img_h as f32)
+                                .round() as i32;
+                            if ix >= 0 && iy >= 0
+                                && (ix as usize) < self.img_w
+                                && (iy as usize) < self.img_h
+                            {
                                 if let Some(ref pixels) = self.orig_pixels {
-                                    let sampled = pixels[iy * self.img_w + ix];
+                                    let sampled = pixels[iy as usize * self.img_w + ix as usize];
                                     if slot_idx < self.slots.len() {
                                         self.slots[slot_idx].sample_rgb = Some(sampled);
                                         self.settings_dirty = true;
                                         self.slot_assignment = None;
+                                        self.status = format!(
+                                            "Sampled #{:02x}{:02x}{:02x} for '{}'.",
+                                            sampled[0], sampled[1], sampled[2],
+                                            self.slots[slot_idx].label
+                                        );
                                         if self.live_preview {
                                             if self.mask_mode {
                                                 self.start_mask(ctx);
@@ -1010,8 +1016,20 @@ impl eframe::App for App {
                                     }
                                 }
                             }
-                            self.picking_slot = None;
                         }
+                        // Always clear pick mode on click, even if out-of-bounds
+                        self.picking_slot = None;
+                    }
+                // ---- Mask painting (fires while button held) ----
+                } else if self.mask_mode && self.slot_assignment.is_some()
+                    && response.is_pointer_button_down_on()
+                {
+                    let erase = ui.input(|i| i.modifiers.shift);
+                    if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                        if self.stroke_pre.is_none() {
+                            self.stroke_begin();
+                        }
+                        self.paint_at(pos, erase, canvas_rect, ctx);
                     }
                 } else if self.stroke_pre.is_some() {
                     // Drag released
@@ -1028,22 +1046,15 @@ impl eframe::App for App {
 
             // Keyboard: P to pick for first unsampled slot
             if ctx.input(|i| i.key_pressed(egui::Key::P)) && self.orig_pixels.is_some() {
-                // find first slot without sample
                 if let Some(idx) = self.slots.iter().position(|s| s.sample_rgb.is_none()) {
                     self.picking_slot = Some(idx);
-                    self.status = format!("Click on the image to sample color for '{}'.", self.slots[idx].label);
+                    self.status = format!(
+                        "Click on the image to sample color for '{}'.",
+                        self.slots[idx].label
+                    );
                 }
             }
         });
-
-        // Second pass: wire up "Pick" buttons properly via stored index
-        // (This is done inline in the slot panel above but we need picking_slot to be set)
-        // The slot panel above uses a placeholder; we handle it through keyboard shortcut P
-        // and a dedicated "Pick" slot button that sets picking_slot.
-        // To properly connect the Pick button in the side panel, we need a workaround since
-        // egui doesn't easily support clicking one panel affecting another in the same frame.
-        // Solution: use egui's memory to pass the clicked slot index.
-        // For now, P key + slot ordering is the primary picking mechanism.
     }
 }
 
@@ -1051,17 +1062,33 @@ impl eframe::App for App {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn pixels_to_texture(ctx: &egui::Context, pixels: &[[u8; 3]], w: usize, h: usize) -> TextureHandle {
-    // Parallel RGBA packing: build Vec<Color32> ([u8;4]) from [u8;3] source.
-    // Color32 is repr(transparent) [u8;4] with layout [r,g,b,a].
+/// Build a `ColorImage` from raw RGB pixels (parallel).
+fn make_color_image(pixels: &[[u8; 3]], w: usize, h: usize) -> ColorImage {
     use rayon::prelude::*;
     let flat: Vec<egui::Color32> = pixels
         .par_iter()
         .map(|p| Color32::from_rgb(p[0], p[1], p[2]))
         .collect();
-    let color_image = ColorImage {
-        size: [w, h],
-        pixels: flat,
-    };
-    ctx.load_texture("canvas", color_image, TextureOptions::LINEAR)
+    ColorImage { size: [w, h], pixels: flat }
+}
+
+/// Upload pixels to the canvas texture.
+/// Re-uses the existing GPU texture allocation when the image size is unchanged
+/// (avoids GPU alloc/free on every preview or mask update).
+fn set_canvas_texture(
+    handle: &mut Option<TextureHandle>,
+    ctx: &egui::Context,
+    pixels: &[[u8; 3]],
+    w: usize,
+    h: usize,
+) {
+    let image = make_color_image(pixels, w, h);
+    match handle {
+        Some(ref mut tex) if tex.size() == [w, h] => {
+            tex.set(image, TextureOptions::LINEAR);
+        }
+        _ => {
+            *handle = Some(ctx.load_texture("canvas", image, TextureOptions::LINEAR));
+        }
+    }
 }
