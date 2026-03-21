@@ -453,19 +453,18 @@ impl App {
     // Mask painting
     // -----------------------------------------------------------------------
 
-    fn paint_at(&mut self, canvas_pos: Pos2, erase: bool, canvas_rect: Rect, ctx: &egui::Context) {
+    fn paint_at(&mut self, canvas_pos: Pos2, erase: bool, img_rect: Rect, ctx: &egui::Context) {
         let assignment = match &mut self.slot_assignment {
             Some(a) => a,
             None => return,
         };
 
         // Map canvas pos → image pixel coords
-        let disp_w = self.img_w as f32 * self.zoom;
-        let disp_h = self.img_h as f32 * self.zoom;
-        let img_rect = Rect::from_center_size(canvas_rect.center(), Vec2::new(disp_w, disp_h));
+        let disp_w = img_rect.width();
+        let disp_h = img_rect.height();
 
-        // Brush radius in image pixels
-        let brush_radius_img = (self.brush_size / self.zoom).max(1.0);
+        // Brush radius in image pixels (minimum 0.5 so a size-1 brush still touches pixels)
+        let brush_radius_img = (self.brush_size / self.zoom).max(0.5);
         let br2 = brush_radius_img * brush_radius_img;
 
         let to_img = |cp: Pos2| -> (i32, i32) {
@@ -772,7 +771,7 @@ impl eframe::App for App {
                 // ---- Brush ----
                 if self.mask_mode {
                     ui.add(
-                        egui::Slider::new(&mut self.brush_size, 5.0..=100.0)
+                        egui::Slider::new(&mut self.brush_size, 1.0..=150.0)
                             .text("Brush")
                             .integer(),
                     );
@@ -935,114 +934,12 @@ impl eframe::App for App {
 
         // Central canvas
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Handle eye-dropper picking: clicking sets sample for a slot
-            let canvas_rect = ui.available_rect_before_wrap();
-
             // Determine cursor
             if self.picking_slot.is_some() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
             } else if self.mask_mode {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Cell);
             }
-
-            // Draw the image
-            if let Some(ref tex) = self.canvas_texture.clone() {
-                let disp_w = self.img_w as f32 * self.zoom;
-                let disp_h = self.img_h as f32 * self.zoom;
-                let img_rect =
-                    Rect::from_center_size(canvas_rect.center(), Vec2::new(disp_w, disp_h));
-
-                // Allocate the full canvas area for interaction so clicks in the
-                // grey border area (zoomed-out images) are still captured.
-                let response = ui.allocate_rect(canvas_rect, egui::Sense::click_and_drag());
-
-                ui.painter().image(
-                    tex.id(),
-                    img_rect,
-                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                    Color32::WHITE,
-                );
-
-                // Brush cursor circle in mask mode
-                if self.mask_mode {
-                    if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                        let erase = ui.input(|i| i.modifiers.shift);
-                        let color = if erase {
-                            Color32::from_rgba_unmultiplied(255, 80, 80, 200)
-                        } else {
-                            let oc = SLOT_OVERLAY_COLORS
-                                [self.paint_slot_idx % SLOT_OVERLAY_COLORS.len()];
-                            Color32::from_rgba_unmultiplied(oc[0], oc[1], oc[2], 200)
-                        };
-                        ui.painter().circle_stroke(
-                            pos,
-                            self.brush_size,
-                            egui::Stroke::new(1.5, color),
-                        );
-                        ctx.request_repaint(); // keep brush cursor live
-                    }
-                }
-
-                // ---- Eye-dropper (fires on click release) ----
-                if let Some(slot_idx) = self.picking_slot {
-                    if response.clicked() {
-                        if let Some(pos) = response.interact_pointer_pos() {
-                            let ix = ((pos.x - img_rect.left()) / disp_w * self.img_w as f32)
-                                .round() as i32;
-                            let iy = ((pos.y - img_rect.top()) / disp_h * self.img_h as f32)
-                                .round() as i32;
-                            if ix >= 0 && iy >= 0
-                                && (ix as usize) < self.img_w
-                                && (iy as usize) < self.img_h
-                            {
-                                if let Some(ref pixels) = self.orig_pixels {
-                                    let sampled = pixels[iy as usize * self.img_w + ix as usize];
-                                    if slot_idx < self.slots.len() {
-                                        self.slots[slot_idx].sample_rgb = Some(sampled);
-                                        self.settings_dirty = true;
-                                        self.slot_assignment = None;
-                                        self.status = format!(
-                                            "Sampled #{:02x}{:02x}{:02x} for '{}'.",
-                                            sampled[0], sampled[1], sampled[2],
-                                            self.slots[slot_idx].label
-                                        );
-                                        if self.live_preview {
-                                            if self.mask_mode {
-                                                self.start_mask(ctx);
-                                            } else {
-                                                self.start_preview(ctx);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        // Always clear pick mode on click, even if out-of-bounds
-                        self.picking_slot = None;
-                    }
-                // ---- Mask painting (fires while button held) ----
-                } else if self.mask_mode && self.slot_assignment.is_some()
-                    && response.is_pointer_button_down_on()
-                {
-                    let erase = ui.input(|i| i.modifiers.shift);
-                    if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-                        if self.stroke_pre.is_none() {
-                            self.stroke_begin();
-                        }
-                        self.paint_at(pos, erase, canvas_rect, ctx);
-                    }
-                } else if self.stroke_pre.is_some() {
-                    // Drag released
-                    self.stroke_end();
-                }
-
-                // Handle "Pick" button clicks from slot panel — we need to track which slot
-                // Currently handled via picking_slot, which needs to be set from the panel.
-                // Re-draw pick buttons here for correct slot index tracking.
-            }
-
-            // Pick buttons re-drawn here so we have mutable self
-            // (We handle the actual pick button logic differently below)
 
             // Keyboard: P to pick for first unsampled slot
             if ctx.input(|i| i.key_pressed(egui::Key::P)) && self.orig_pixels.is_some() {
@@ -1053,6 +950,117 @@ impl eframe::App for App {
                         self.slots[idx].label
                     );
                 }
+            }
+
+            if let Some(tex) = self.canvas_texture.clone() {
+                let disp_w = self.img_w as f32 * self.zoom;
+                let disp_h = self.img_h as f32 * self.zoom;
+                let avail = ui.available_size();
+
+                // Content is at least as large as the viewport so the scroll area
+                // fills the panel; when image is larger the content expands for scrolling.
+                let content_size = Vec2::new(disp_w.max(avail.x), disp_h.max(avail.y));
+
+                // Centering offsets: when image is smaller than viewport, pad it.
+                let off_x = ((avail.x - disp_w) * 0.5).max(0.0);
+                let off_y = ((avail.y - disp_h) * 0.5).max(0.0);
+
+                egui::ScrollArea::both()
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
+                        let (content_rect, response) = ui
+                            .allocate_exact_size(content_size, egui::Sense::click_and_drag());
+
+                        let img_rect = Rect::from_min_size(
+                            content_rect.min + Vec2::new(off_x, off_y),
+                            Vec2::new(disp_w, disp_h),
+                        );
+
+                        ui.painter().image(
+                            tex.id(),
+                            img_rect,
+                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+
+                        // Brush cursor circle in mask mode
+                        if self.mask_mode {
+                            if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                                let erase = ui.input(|i| i.modifiers.shift);
+                                let color = if erase {
+                                    Color32::from_rgba_unmultiplied(255, 80, 80, 200)
+                                } else {
+                                    let oc = SLOT_OVERLAY_COLORS
+                                        [self.paint_slot_idx % SLOT_OVERLAY_COLORS.len()];
+                                    Color32::from_rgba_unmultiplied(oc[0], oc[1], oc[2], 200)
+                                };
+                                ui.painter().circle_stroke(
+                                    pos,
+                                    self.brush_size,
+                                    egui::Stroke::new(1.5, color),
+                                );
+                                ctx.request_repaint(); // keep brush cursor live
+                            }
+                        }
+
+                        // ---- Eye-dropper (fires on click release) ----
+                        if let Some(slot_idx) = self.picking_slot {
+                            if response.clicked() {
+                                if let Some(pos) = response.interact_pointer_pos() {
+                                    let ix = ((pos.x - img_rect.left()) / disp_w
+                                        * self.img_w as f32)
+                                        .round() as i32;
+                                    let iy = ((pos.y - img_rect.top()) / disp_h
+                                        * self.img_h as f32)
+                                        .round() as i32;
+                                    if ix >= 0
+                                        && iy >= 0
+                                        && (ix as usize) < self.img_w
+                                        && (iy as usize) < self.img_h
+                                    {
+                                        if let Some(ref pixels) = self.orig_pixels {
+                                            let sampled =
+                                                pixels[iy as usize * self.img_w + ix as usize];
+                                            if slot_idx < self.slots.len() {
+                                                self.slots[slot_idx].sample_rgb = Some(sampled);
+                                                self.settings_dirty = true;
+                                                self.slot_assignment = None;
+                                                self.status = format!(
+                                                    "Sampled #{:02x}{:02x}{:02x} for '{}'.",
+                                                    sampled[0], sampled[1], sampled[2],
+                                                    self.slots[slot_idx].label
+                                                );
+                                                if self.live_preview {
+                                                    if self.mask_mode {
+                                                        self.start_mask(ctx);
+                                                    } else {
+                                                        self.start_preview(ctx);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                // Always clear pick mode on click, even if out-of-bounds
+                                self.picking_slot = None;
+                            }
+                        // ---- Mask painting (fires while button held) ----
+                        } else if self.mask_mode
+                            && self.slot_assignment.is_some()
+                            && response.is_pointer_button_down_on()
+                        {
+                            let erase = ui.input(|i| i.modifiers.shift);
+                            if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                                if self.stroke_pre.is_none() {
+                                    self.stroke_begin();
+                                }
+                                self.paint_at(pos, erase, img_rect, ctx);
+                            }
+                        } else if self.stroke_pre.is_some() {
+                            // Drag released
+                            self.stroke_end();
+                        }
+                    });
             }
         });
     }
